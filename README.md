@@ -102,7 +102,7 @@ controllers:
 persistence:
   vlmocr:
     type: image
-    image: ghcr.io/anokfireball/paperless-vlm-ocr:0.1.1
+    image: ghcr.io/anokfireball/paperless-vlm-ocr:0.2.0
     globalMounts:
       - path: /usr/src/paperless/vlm-ocr
         readOnly: true
@@ -152,18 +152,58 @@ All settings come from the environment and are read on every parse.
 | `PAPERLESS_VLM_OCR_IMAGE_PX` | `1800` | Long side of the page image sent to the model |
 | `PAPERLESS_VLM_OCR_DECISION_LOG` | `<DATA_DIR>/vlm-ocr/decisions.jsonl` | JSONL decision log path |
 
+## Logging
+
+The plugin logs on `paperless.parsing.vlm_ocr`, so its lines land in
+`paperless.log` (with the rest of `paperless.*`) and on the worker's stdout. The
+Tesseract parser keeps its own `paperless.parsing.tesseract` logger, so stock
+messages such as `pdftotext exited 0` are unchanged.
+
+One start line per document, one line per page, one line per model call and one
+summary per document (`file` is the name only, `sha` its first 12 hex digits):
+
+```
+vlm_ocr start file=statement.pdf sha=a1b2c3d4e5f6 mime=application/pdf pages=5 archive=yes gate_mode=shadow threshold=0.90 model=vision-model
+vlm_ocr page 2/5 sha=a1b2c3d4e5f6 kind=gated decision=keep coverage=0.987 support=0.991 threshold=0.90 layer_tokens=120 ref_tokens=118 source=layer reason=-
+vlm_ocr page 1/5 sha=a1b2c3d4e5f6 kind=empty_layer decision=vlm coverage=- support=- threshold=0.90 layer_tokens=0 ref_tokens=- source=vlm reason=- vlm_vs_fallback_coverage=0.941 vlm_vs_fallback_support=0.933
+vlm_ocr page 4/5 sha=a1b2c3d4e5f6 kind=gated decision=vlm coverage=0.312 support=0.298 threshold=0.90 layer_tokens=87 ref_tokens=95 source=tesseract reason=RuntimeError
+vlm_ocr llm page=1 sha=a1b2c3d4e5f6 model=vision-model host=api.example.test attempts=2 finish_reason=stop tokens_in=1700 tokens_out=420 seconds=12.3 image=1800x2546 bytes=731003 chars=51 response_id=chatcmpl-abc request_id=req-123
+vlm_ocr llm page=3 sha=a1b2c3d4e5f6 model=vision-model host=api.example.test failed error=APIStatusError status=429 request_id=req-999 seconds=3.5
+vlm_ocr llm page=2 sha=a1b2c3d4e5f6 model=vision-model host=api.example.test attempts=2 finish_reason=stop tokens_in=1700 tokens_out=420 seconds=12.3 image=1800x2546 bytes=731003 chars=167 response_id=chatcmpl-abc request_id=req-123 rejected reason=repetition fallback_chars=812
+vlm_ocr summary file=statement.pdf sha=a1b2c3d4e5f6 pages=5 keep=2 vlm=2 fallback=1 would_vlm=0 no_signal=0 gate_mode=shadow threshold=0.90 coverage_min=0.312 coverage_mean=0.649 support_min=0.298 support_mean=0.644 sources=LLVTL content=assembled tokens_in=1700 tokens_out=420 seconds=18.0
+```
+
+- `coverage`/`support` are `-` when the page has no reference read; `reason` is
+  a fallback or rejection reason, or the exception class of a failed attempt.
+- `vlm_vs_fallback_*` compares the model text with the text it displaced, so a
+  suspicious `source=vlm` page is visible without opening the document.
+- The summary's `sources` has one letter per page (`L` layer, `V` model,
+  `T` Tesseract) and `content` says whether `document.text` was rewritten
+  (`assembled`) or left as the parent parser produced it (`parent`).
+- Lines never contain the API key, the endpoint path or query, request bodies or
+  transcribed text: failures report the exception class, HTTP status and request
+  id, while calls - accepted or rejected - report attempts, sizes, token counts
+  and the response/request ids only.
+
 ## Decision log
 
 One JSON line per page, appended whether or not anything changed:
 
-`ts`, `sha256` (of the parsed file), `mime`, `page`, `pages`, `kind`
+`ts`, `sha256` (of the parsed file), `mime`, `file`, `page`, `pages`, `kind`
 (`gated`/`empty_layer`), `decision` (`keep`/`vlm`/`would_vlm`/`no_signal`),
-`coverage`, `support`, `layer_tokens`, `ref_tokens`, `source`
+`coverage`, `support`, `threshold`, `layer_tokens`, `ref_tokens`, `source`
 (`layer`/`vlm`/`tesseract`), `fallback_reason`, `vlm_seconds`, `input_tokens`,
-`output_tokens`, `gate_mode`, `plugin_version`.
+`output_tokens`, `model`, `finish_reason`, `attempts`, `response_id`,
+`request_id`, `payload_bytes`, `image_px`, `vlm_chars`, `fallback_chars`,
+`layer_chars`, `vlm_vs_fallback_coverage`, `vlm_vs_fallback_support`,
+`error_status`, `gate_mode`, `plugin_version`.
 
-A failing log write is a warning, never a parse failure. Use the `sha256` to map
-a record back with `Document.objects.filter(checksum=...)`.
+`fallback_reason` carries a rejection reason, a fallback failure, or the
+exception class of a failed model call (with its HTTP status in `error_status`);
+`attempts` counts the first request plus retries, and `response_id`/
+`request_id` identify the call upstream. A failing log write is a warning, never
+a parse failure. Use the `sha256` to map a record back with
+`Document.objects.filter(checksum=...)`.
 
 ## Offline gate scan
 

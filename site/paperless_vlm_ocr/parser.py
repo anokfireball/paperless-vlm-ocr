@@ -23,9 +23,14 @@ from paperless_vlm_ocr import __version__
 from paperless_vlm_ocr.config import VlmOcrConfig
 from paperless_vlm_ocr.decisions import append as append_decision
 from paperless_vlm_ocr.gate import agreement
-from paperless_vlm_ocr.gate import passes
 from paperless_vlm_ocr.gate import classify
+from paperless_vlm_ocr.gate import passes
 from paperless_vlm_ocr.gate import tokenize
+from paperless_vlm_ocr.logfmt import endpoint_host
+from paperless_vlm_ocr.logfmt import format_page_line
+from paperless_vlm_ocr.logfmt import format_start_line
+from paperless_vlm_ocr.logfmt import format_summary_line
+from paperless_vlm_ocr.logfmt import sha_prefix
 from paperless_vlm_ocr.pages import image_to_png
 from paperless_vlm_ocr.pages import layer_text
 from paperless_vlm_ocr.pages import page_count
@@ -34,12 +39,17 @@ from paperless_vlm_ocr.pages import tesseract_text
 from paperless_vlm_ocr.vlm import VlmClient
 from paperless_vlm_ocr.vlm import VlmResult
 from paperless_vlm_ocr.vlm import clean
+from paperless_vlm_ocr.vlm import format_llm_failure_line
+from paperless_vlm_ocr.vlm import format_llm_line
+from paperless_vlm_ocr.vlm import format_llm_rejection_line
 from paperless_vlm_ocr.vlm import reject_reason
 
 LOGGER_NAME = "paperless.parsing.vlm_ocr"
 logger = logging.getLogger(LOGGER_NAME)
 
 Source = Literal["layer", "vlm", "tesseract"]
+
+_REJECT_REASONS = frozenset({"truncated", "empty", "repetition", "runaway"})
 
 _warned: set[str] = set()
 
@@ -72,6 +82,31 @@ class _Page:
     vlm_seconds: float | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
+    vlm_called: bool = False
+    finish_reason: str | None = None
+    attempts: int | None = None
+    response_id: str | None = None
+    request_id: str | None = None
+    payload_bytes: int | None = None
+    image_px: str | None = None
+    vlm_chars: int | None = None
+    fallback_chars: int | None = None
+    vlm_vs_fallback_coverage: float | None = None
+    vlm_vs_fallback_support: float | None = None
+    error_status: int | None = None
+
+
+@dataclass
+class _Call:
+    """Outcome of one page's transcription attempt."""
+
+    fallback: str = ""
+    result: VlmResult | None = None
+    error: str | None = None
+    called: bool = False
+    status: int | None = None
+    request_id: str | None = None
+    seconds: float | None = None
 
 
 class VlmOcrParser(RasterisedDocumentParser):
@@ -132,7 +167,8 @@ class VlmOcrParser(RasterisedDocumentParser):
 
     def __init__(self, logging_group: object | None = None) -> None:
         super().__init__(logging_group)
-        self.log = logging.getLogger(LOGGER_NAME)
+        # ``self.log`` stays the parent's Tesseract logger on purpose: its own
+        # messages must keep their historical logger and format.
         self.cfg = VlmOcrConfig.from_env()
 
     def parse(
@@ -149,7 +185,7 @@ class VlmOcrParser(RasterisedDocumentParser):
             self._process(document_path, mime_type)
         except Exception:
             self.text = parent_text
-            self.log.exception(
+            logger.exception(
                 "vlm_ocr failed, keeping Tesseract/layer result",
             )
 
@@ -160,6 +196,8 @@ class VlmOcrParser(RasterisedDocumentParser):
     def _process(self, document_path: Path, mime_type: str) -> None:
         cfg = self.cfg
         started = time.monotonic()
+        name = document_path.name
+        sha256 = hashlib.sha256(document_path.read_bytes()).hexdigest()
 
         orig_pdf = document_path if mime_type == "application/pdf" else None
         render_pdf = (
@@ -167,25 +205,39 @@ class VlmOcrParser(RasterisedDocumentParser):
         )
         pages_total = page_count(render_pdf) if render_pdf is not None else 1
         if pages_total > cfg.max_pages:
-            self.log.warning(
-                "vlm_ocr skipped: %d pages > max_pages=%d",
+            logger.warning(
+                "vlm_ocr skipped file=%s sha=%s pages=%d max_pages=%d",
+                name,
+                sha_prefix(sha256),
                 pages_total,
                 cfg.max_pages,
             )
             return
+        logger.info(
+            format_start_line(
+                file=name,
+                sha256=sha256,
+                mime=mime_type,
+                pages=pages_total,
+                archive=self.archive_path is not None,
+                gate_mode=cfg.gate_mode,
+                threshold=cfg.threshold,
+                model=cfg.model,
+            ),
+        )
 
-        sha256 = hashlib.sha256(document_path.read_bytes()).hexdigest()
         pages = [_Page(number=number) for number in range(1, pages_total + 1)]
 
         self._read_layers(pages, orig_pdf)
         self._reference_ocr(pages, orig_pdf)
         self._classify(pages)
-        self._transcribe(pages, document_path, render_pdf)
-        self._apply_text(pages)
-        self._write_decisions(pages, pages_total, mime_type, sha256)
+        self._transcribe(pages, document_path, render_pdf, sha256)
+        self._log_pages(pages, pages_total, sha256)
+        assembled = self._apply_text(pages)
+        self._write_decisions(pages, pages_total, mime_type, sha256, name)
 
         elapsed = time.monotonic() - started
-        self._log_summary(pages, elapsed)
+        self._log_summary(pages, elapsed, name, sha256, assembled)
 
     # ------------------------------------------------------------------
     # Phase A: layer text, reference OCR, gate verdict
@@ -202,7 +254,7 @@ class VlmOcrParser(RasterisedDocumentParser):
             try:
                 page.layer = layer_text(orig_pdf, page.number)
             except Exception as exc:
-                self.log.warning(
+                logger.warning(
                     "vlm_ocr page %d: cannot read text layer (%s)",
                     page.number,
                     type(exc).__name__,
@@ -236,7 +288,7 @@ class VlmOcrParser(RasterisedDocumentParser):
                     page.ref = future.result()
                 except Exception as exc:
                     page.ref_error = True
-                    self.log.warning(
+                    logger.warning(
                         "vlm_ocr page %d: reference OCR failed (%s)",
                         page.number,
                         type(exc).__name__,
@@ -284,6 +336,7 @@ class VlmOcrParser(RasterisedDocumentParser):
         pages: list[_Page],
         document_path: Path,
         render_pdf: Path | None,
+        sha256: str,
     ) -> None:
         targets = [page for page in pages if self._needs_vlm(page)]
         if not targets:
@@ -293,15 +346,15 @@ class VlmOcrParser(RasterisedDocumentParser):
             client: VlmClient | None = VlmClient(self.cfg)
         except Exception as exc:
             client = None
-            error: str | None = type(exc).__name__
-            self.log.warning(
+            client_error: str | None = type(exc).__name__
+            logger.warning(
                 "vlm_ocr: cannot create VLM client (%s)",
-                error,
+                client_error,
             )
         if client is None:
             for page in targets:
                 fallback = self._fallback_text(page, document_path, render_pdf)
-                self._apply_vlm(page, None, fallback, error)
+                self._apply_vlm(page, _Call(fallback=fallback, error=client_error))
             return
 
         workers = max(1, self.cfg.concurrency)
@@ -319,12 +372,11 @@ class VlmOcrParser(RasterisedDocumentParser):
             for future in as_completed(futures):
                 page = futures[future]
                 try:
-                    result, fallback, failure = future.result()
+                    call = future.result()
                 except Exception as exc:
-                    result = None
-                    fallback = ""
-                    failure = type(exc).__name__
-                self._apply_vlm(page, result, fallback, failure)
+                    call = _Call(error=type(exc).__name__)
+                self._apply_vlm(page, call)
+                self._log_llm(page, call, sha256)
 
     def _vlm_page(
         self,
@@ -332,14 +384,30 @@ class VlmOcrParser(RasterisedDocumentParser):
         document_path: Path,
         render_pdf: Path | None,
         page: _Page,
-    ) -> tuple[VlmResult | None, str, str | None]:
+    ) -> _Call:
         fallback = self._fallback_text(page, document_path, render_pdf)
+        started = time.monotonic()
         try:
             png = self._render_vlm_page(document_path, render_pdf, page.number)
+        except Exception as exc:
+            return _Call(fallback=fallback, error=type(exc).__name__)
+        try:
             result = client.transcribe(png.read_bytes())
         except Exception as exc:
-            return None, fallback, type(exc).__name__
-        return result, fallback, None
+            return _Call(
+                fallback=fallback,
+                error=type(exc).__name__,
+                called=True,
+                status=getattr(exc, "status_code", None),
+                request_id=getattr(exc, "request_id", None),
+                seconds=time.monotonic() - started,
+            )
+        return _Call(
+            fallback=fallback,
+            result=result,
+            called=True,
+            seconds=time.monotonic() - started,
+        )
 
     def _render_vlm_page(
         self,
@@ -377,7 +445,7 @@ class VlmOcrParser(RasterisedDocumentParser):
                 return page.layer
             return page.ref or ""
         except Exception as exc:
-            self.log.warning(
+            logger.warning(
                 "vlm_ocr page %d: fallback text failed (%s)",
                 page.number,
                 type(exc).__name__,
@@ -403,28 +471,47 @@ class VlmOcrParser(RasterisedDocumentParser):
             png = image_to_png(document_path, out, self.cfg.image_px)
         return tesseract_text(png, self.settings.language)
 
-    def _apply_vlm(
-        self,
-        page: _Page,
-        result: VlmResult | None,
-        fallback: str,
-        error: str | None,
-    ) -> None:
+    def _apply_vlm(self, page: _Page, call: _Call) -> None:
+        result = call.result
+        page.fallback_chars = len(call.fallback)
+        text = ""
         if result is not None:
+            page.vlm_called = True
             page.vlm_seconds = result.seconds
             page.input_tokens = result.input_tokens
             page.output_tokens = result.output_tokens
+            page.finish_reason = result.finish_reason
+            page.attempts = result.attempts
+            page.response_id = result.response_id
+            page.request_id = result.request_id
+            page.payload_bytes = result.payload_bytes
+            page.image_px = result.image_px
+            text = clean(result.text)
+            page.vlm_chars = len(text)
+            fallback_tokens = tokenize(call.fallback)
+            if fallback_tokens:
+                (
+                    page.vlm_vs_fallback_coverage,
+                    page.vlm_vs_fallback_support,
+                ) = agreement(tokenize(text), fallback_tokens)
 
-        reason = error if result is None else reject_reason(result, fallback)
+        reason = (
+            call.error
+            if result is None
+            else reject_reason(result, call.fallback)
+        )
+        if result is None:
+            page.error_status = call.status
+            page.request_id = call.request_id
+            page.vlm_seconds = call.seconds
         if result is None or reason is not None:
-            page.text = fallback
+            page.text = call.fallback
             page.fallback_reason = reason
             page.source = (
                 "layer" if page.decision == "no_signal" else "tesseract"
             )
             return
 
-        text = clean(result.text)
         if page.decision == "no_signal":
             coverage, support = agreement(
                 tokenize(page.layer),
@@ -439,16 +526,57 @@ class VlmOcrParser(RasterisedDocumentParser):
         page.text = text
         page.source = "vlm"
 
+    def _log_llm(self, page: _Page, call: _Call, sha256: str) -> None:
+        cfg = self.cfg
+        host = endpoint_host(cfg.endpoint)
+        if call.result is not None:
+            if page.fallback_reason in _REJECT_REASONS:
+                logger.warning(
+                    format_llm_rejection_line(
+                        page=page.number,
+                        sha256=sha256,
+                        model=cfg.model,
+                        host=host,
+                        reason=page.fallback_reason or "-",
+                        result=call.result,
+                        fallback_chars=len(call.fallback),
+                    ),
+                )
+            else:
+                logger.info(
+                    format_llm_line(
+                        page=page.number,
+                        sha256=sha256,
+                        model=cfg.model,
+                        host=host,
+                        result=call.result,
+                    ),
+                )
+        elif call.called:
+            logger.warning(
+                format_llm_failure_line(
+                    page=page.number,
+                    sha256=sha256,
+                    model=cfg.model,
+                    host=host,
+                    error=call.error or "-",
+                    status=call.status,
+                    request_id=call.request_id,
+                    seconds=call.seconds,
+                ),
+            )
+
     # ------------------------------------------------------------------
     # Result assembly, decision log, summary
     # ------------------------------------------------------------------
 
-    def _apply_text(self, pages: list[_Page]) -> None:
+    def _apply_text(self, pages: list[_Page]) -> bool:
         if not any(page.source == "vlm" for page in pages):
-            return
+            return False
         self.text = post_process_text(
             "\n\n".join(page.text for page in pages),
         ) or ""
+        return True
 
     def _write_decisions(
         self,
@@ -456,6 +584,7 @@ class VlmOcrParser(RasterisedDocumentParser):
         pages_total: int,
         mime_type: str,
         sha256: str,
+        file_name: str,
     ) -> None:
         ts = datetime.now(timezone.utc).isoformat()
         gate_mode = self.cfg.gate_mode
@@ -466,12 +595,14 @@ class VlmOcrParser(RasterisedDocumentParser):
                     "ts": ts,
                     "sha256": sha256,
                     "mime": mime_type,
+                    "file": file_name,
                     "page": page.number,
                     "pages": pages_total,
                     "kind": page.kind,
                     "decision": page.decision,
                     "coverage": page.coverage,
                     "support": page.support,
+                    "threshold": self.cfg.threshold,
                     "layer_tokens": page.layer_tokens,
                     "ref_tokens": page.ref_tokens,
                     "source": page.source,
@@ -479,12 +610,59 @@ class VlmOcrParser(RasterisedDocumentParser):
                     "vlm_seconds": page.vlm_seconds,
                     "input_tokens": page.input_tokens,
                     "output_tokens": page.output_tokens,
+                    "model": self.cfg.model,
+                    "finish_reason": page.finish_reason,
+                    "attempts": page.attempts,
+                    "response_id": page.response_id,
+                    "request_id": page.request_id,
+                    "payload_bytes": page.payload_bytes,
+                    "image_px": page.image_px,
+                    "vlm_chars": page.vlm_chars,
+                    "fallback_chars": page.fallback_chars,
+                    "layer_chars": len(page.layer),
+                    "vlm_vs_fallback_coverage": page.vlm_vs_fallback_coverage,
+                    "vlm_vs_fallback_support": page.vlm_vs_fallback_support,
+                    "error_status": page.error_status,
                     "gate_mode": gate_mode,
                     "plugin_version": __version__,
                 },
             )
 
-    def _log_summary(self, pages: list[_Page], elapsed: float) -> None:
+    def _log_pages(
+        self,
+        pages: list[_Page],
+        pages_total: int,
+        sha256: str,
+    ) -> None:
+        for page in pages:
+            logger.info(
+                format_page_line(
+                    page=page.number,
+                    pages=pages_total,
+                    sha256=sha256,
+                    kind=page.kind,
+                    decision=page.decision,
+                    coverage=page.coverage,
+                    support=page.support,
+                    threshold=self.cfg.threshold,
+                    layer_tokens=page.layer_tokens,
+                    ref_tokens=page.ref_tokens,
+                    source=page.source,
+                    reason=page.fallback_reason,
+                    vlm_called=page.vlm_called,
+                    vlm_vs_fallback_coverage=page.vlm_vs_fallback_coverage,
+                    vlm_vs_fallback_support=page.vlm_vs_fallback_support,
+                ),
+            )
+
+    def _log_summary(
+        self,
+        pages: list[_Page],
+        elapsed: float,
+        file_name: str,
+        sha256: str,
+        assembled: bool,
+    ) -> None:
         keep = sum(1 for page in pages if page.source == "layer")
         vlm = sum(1 for page in pages if page.source == "vlm")
         fallback = sum(1 for page in pages if page.source == "tesseract")
@@ -492,16 +670,40 @@ class VlmOcrParser(RasterisedDocumentParser):
         no_signal = sum(1 for page in pages if page.decision == "no_signal")
         tokens_in = sum(page.input_tokens or 0 for page in pages)
         tokens_out = sum(page.output_tokens or 0 for page in pages)
-        self.log.info(
-            "vlm_ocr pages=%d keep=%d vlm=%d fallback=%d would_vlm=%d "
-            "no_signal=%d tokens_in=%d tokens_out=%d seconds=%.1f",
-            len(pages),
-            keep,
-            vlm,
-            fallback,
-            would_vlm,
-            no_signal,
-            tokens_in,
-            tokens_out,
-            elapsed,
+
+        gated = [
+            page
+            for page in pages
+            if page.kind == "gated" and page.coverage is not None
+        ]
+        coverages = [page.coverage for page in gated if page.coverage is not None]
+        supports = [page.support for page in gated if page.support is not None]
+        sources = "".join(
+            {"layer": "L", "vlm": "V", "tesseract": "T"}[page.source]
+            for page in pages
+        )
+        logger.info(
+            format_summary_line(
+                file=file_name,
+                sha256=sha256,
+                pages=len(pages),
+                keep=keep,
+                vlm=vlm,
+                fallback=fallback,
+                would_vlm=would_vlm,
+                no_signal=no_signal,
+                gate_mode=self.cfg.gate_mode,
+                threshold=self.cfg.threshold,
+                coverage_min=min(coverages) if coverages else None,
+                coverage_mean=(
+                    sum(coverages) / len(coverages) if coverages else None
+                ),
+                support_min=min(supports) if supports else None,
+                support_mean=sum(supports) / len(supports) if supports else None,
+                sources=sources,
+                content="assembled" if assembled else "parent",
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                seconds=elapsed,
+            ),
         )
