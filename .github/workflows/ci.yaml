@@ -3,15 +3,10 @@ name: CI
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
 
 permissions:
   contents: read
-
-env:
-  # Single place to bump the Paperless release the plugin is verified against.
-  PAPERLESS_IMAGE: ghcr.io/paperless-ngx/paperless-ngx:3.5.1
 
 jobs:
   test:
@@ -34,6 +29,14 @@ jobs:
             exit 1
           fi
 
+      - name: Check the three version places agree
+        run: |
+          version=$(PYTHONPATH=site python3 -c 'import paperless_vlm_ocr; print(paperless_vlm_ocr.__version__)')
+          dist=$(basename "$(ls -d site/paperless_vlm_ocr-*.dist-info)")
+          test "$dist" = "paperless_vlm_ocr-${version}.dist-info"
+          test "$(sed -n 's/^Version: //p' "site/${dist}/METADATA")" = "$version"
+          echo "dist-info directory and METADATA match version ${version}"
+
       - name: Run unit tests
         run: PYTHONPATH=site pytest -q tests
 
@@ -43,14 +46,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Check dist-info directory matches __version__
+      - name: Read the verified Paperless version
         run: |
-          version=$(PYTHONPATH=site python3 -c 'import paperless_vlm_ocr; print(paperless_vlm_ocr.__version__)')
-          dist=$(basename "$(ls -d site/paperless_vlm_ocr-*.dist-info)")
-          test "$dist" = "paperless_vlm_ocr-${version}.dist-info"
-          echo "dist-info directory matches version ${version}"
+          version=$(PYTHONPATH=site python3 -c 'import paperless_vlm_ocr; print(paperless_vlm_ocr.VERIFIED_PAPERLESS)')
+          echo "PAPERLESS_IMAGE=ghcr.io/paperless-ngx/paperless-ngx:${version}" >> "$GITHUB_ENV"
+          echo "Verifying against Paperless ${version}"
 
-      - name: Check entry point and metadata in the Paperless image
+      - name: Check supported version and entry point
         run: |
           docker run --rm --read-only --tmpfs /tmp \
             -v "$PWD/site:/usr/src/paperless/vlm-ocr:ro" \
@@ -58,13 +60,24 @@ jobs:
             --entrypoint python3 "$PAPERLESS_IMAGE" -c '
           from importlib.metadata import entry_points, version
 
+          from paperless.version import __version__ as running
+
           import paperless_vlm_ocr
 
           eps = [e.value for e in entry_points(group="paperless_ngx.parsers")]
           assert eps == ["paperless_vlm_ocr.parser:VlmOcrParser"], eps
           dist_version = version("paperless-vlm-ocr")
           assert dist_version == paperless_vlm_ocr.__version__, dist_version
-          print("entry point ok:", dist_version)
+          verified = tuple(
+              int(part) for part in paperless_vlm_ocr.VERIFIED_PAPERLESS.split(".")
+          )
+          supported = sorted(paperless_vlm_ocr.SUPPORTED_PAPERLESS)
+          assert verified[:2] in paperless_vlm_ocr.SUPPORTED_PAPERLESS, (
+              paperless_vlm_ocr.VERIFIED_PAPERLESS,
+              supported,
+          )
+          assert tuple(running[:2]) == verified[:2], (running, verified)
+          print("entry point ok:", dist_version, "paperless", running, "supported", supported)
           '
 
       - name: Run unit tests inside the Paperless image when pytest is available
@@ -80,47 +93,81 @@ jobs:
             echo "pytest is not installed in the Paperless image; skipping in-image tests"
           fi'
 
+      - name: Smoke parse inside the Paperless image
+        run: |
+          docker run --rm \
+            --tmpfs /tmp \
+            --workdir /usr/src/paperless/src \
+            -v "$PWD/site:/usr/src/paperless/vlm-ocr:ro" \
+            -v "$PWD/tests:/t:ro" \
+            -e PYTHONPATH=/usr/src/paperless/src:/usr/src/paperless/vlm-ocr \
+            -e HOME=/tmp \
+            -e PAPERLESS_SECRET_KEY=ci \
+            -e PAPERLESS_DATA_DIR=/tmp/data \
+            -e PAPERLESS_MEDIA_ROOT=/tmp/media \
+            -e PAPERLESS_CONSUMPTION_DIR=/tmp/consume \
+            -e PAPERLESS_OCR_LANGUAGE=eng \
+            -e PAPERLESS_VLM_OCR_ENABLED=true \
+            -e PAPERLESS_VLM_OCR_ENDPOINT=http://127.0.0.1:9/v1 \
+            -e PAPERLESS_VLM_OCR_API_KEY=ci \
+            -e PAPERLESS_VLM_OCR_MODEL=ci \
+            -e PAPERLESS_VLM_OCR_TIMEOUT_S=5 \
+            -e PAPERLESS_VLM_OCR_DECISION_LOG=/tmp/decisions.jsonl \
+            --entrypoint sh "$PAPERLESS_IMAGE" -c '
+          mkdir -p /tmp/data /tmp/media /tmp/consume &&
+            python3 manage.py migrate --noinput &&
+            python3 /t/smoke_parse.py'
+
   image:
-    name: Publish OCI image
+    name: Publish image and release
     needs: [test, paperless]
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       packages: write
     steps:
       - uses: actions/checkout@v5
 
-      - name: Check git tag matches __version__
+      - name: Read version and look for its tag
+        id: version
         run: |
-          tag="${GITHUB_REF#refs/tags/v}"
           version=$(PYTHONPATH=site python3 -c 'import paperless_vlm_ocr; print(paperless_vlm_ocr.__version__)')
-          test "$tag" = "$version"
-          echo "tag ${tag} matches plugin version"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          if [ -n "$(git ls-remote --tags origin "refs/tags/v${version}")" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::tag v${version} already exists; nothing to publish"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "publishing ${version}"
+          fi
 
       - uses: docker/setup-buildx-action@v3
+        if: steps.version.outputs.exists == 'false'
 
       - uses: docker/login-action@v3
+        if: steps.version.outputs.exists == 'false'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/anokfireball/paperless-vlm-ocr
-          tags: |
-            type=semver,pattern={{version}}
-          flavor: |
-            latest=false
-
       - uses: docker/build-push-action@v6
+        if: steps.version.outputs.exists == 'false'
         with:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ghcr.io/anokfireball/paperless-vlm-ocr:${{ steps.version.outputs.version }}
           labels: |
-            ${{ steps.meta.outputs.labels }}
             org.opencontainers.image.source=https://github.com/anokfireball/paperless-vlm-ocr
+
+      - name: Create tag and GitHub release
+        if: steps.version.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="v${{ steps.version.outputs.version }}"
+          git tag "$tag"
+          git push origin "$tag"
+          gh release create "$tag" --generate-notes

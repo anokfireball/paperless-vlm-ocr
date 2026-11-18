@@ -57,9 +57,11 @@ is kept: the plugin fails open.
 
 ## Compatibility guard
 
-`SUPPORTED_PAPERLESS` in `paperless_vlm_ocr/__init__.py` lists the verified
-Paperless `(major, minor)` versions. On any other version `score()` returns
-`None`, so ingestion falls back to stock Tesseract instead of breaking.
+`SUPPORTED_PAPERLESS` in `paperless_vlm_ocr/__init__.py` lists the Paperless
+`(major, minor)` versions the plugin runs on, and `VERIFIED_PAPERLESS` right
+above it names the image CI verifies the plugin against. On any other minor
+`score()` returns `None`, so ingestion falls back to stock Tesseract instead of
+breaking.
 
 The parser scores `15`, above the built-in Tesseract parser (`10`), and is only
 selected when `PAPERLESS_VLM_OCR_ENABLED=true` and endpoint, API key and model
@@ -229,13 +231,38 @@ The version lives in three places and they must move together:
 2. the dist-info directory name `site/paperless_vlm_ocr-<version>.dist-info/`,
 3. the `Version:` line in that directory's `METADATA`.
 
-Then tag `vX.Y.Z` (without a `v` inside the version) and push the tag. CI
-verifies the tag against `__version__`, reruns the tests and publishes
-`ghcr.io/anokfireball/paperless-vlm-ocr:X.Y.Z` for `linux/amd64` and
-`linux/arm64`.
+Bump all three in one pull request and merge it to `main`. CI verifies the
+plugin against the Paperless-ngx image named by `VERIFIED_PAPERLESS`, runs the
+unit tests and a real parse on a one-page scan inside that image, and then:
 
-Supporting a new Paperless minor release: verify the plugin against the new
-image, add the `(major, minor)` tuple to `SUPPORTED_PAPERLESS`, bump the version,
-and update `PAPERLESS_IMAGE` in `.github/workflows/ci.yaml`.
+1. publishes `ghcr.io/anokfireball/paperless-vlm-ocr:<version>` for
+   `linux/amd64` and `linux/arm64`,
+2. creates the `v<version>` tag and a GitHub release with generated notes.
+
+A push to `main` whose version is already tagged publishes nothing: no image is
+rebuilt and no release is recreated.
+
+Renovate keeps `VERIFIED_PAPERLESS` current; the annotation above it in
+`site/paperless_vlm_ocr/__init__.py` is a `renovate.json` custom manager. Its
+post-upgrade task, `node .github/scripts/renovate-paperless-bump.mjs`, either
+
+- leaves everything alone for a patch update of an already supported minor
+  (the CI in-image checks, entry point and smoke parse, prove the new image on
+  the PR), or
+- adds the new `(major, minor)` to `SUPPORTED_PAPERLESS` and bumps the plugin's
+  patch version in all three places, so merging the PR publishes a new image.
 
 `site/` must not contain tab characters; CI fails on them. `$` is fine.
+
+### Compatibility and upgrade order
+
+On a Paperless minor that is not in `SUPPORTED_PAPERLESS`, `score()` returns
+`None`: the plugin steps aside with a warning and ingestion uses stock Tesseract
+parsing. A Paperless upgrade therefore cannot break parsing, even before a
+plugin release catches up.
+
+When upgrading Paperless to a new minor, merge and deploy the plugin release
+that lists it first. Listing a new minor keeps the older ones (they stay in
+`SUPPORTED_PAPERLESS`), so that release still runs on the Paperless version you
+are replacing, and deploying it before the Paperless upgrade leaves no window
+without the plugin.

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "The Paperless-ngx image the plugin is verified against.",
+      "managerFilePatterns": [
+        "/^site\\/paperless_vlm_ocr\\/__init__\\.py$/"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\nVERIFIED_PAPERLESS = \"(?<currentValue>\\d+\\.\\d+\\.\\d+)\""
+      ],
+      "versioningTemplate": "docker"
+    }
+  ],
+  "packageRules": [
+    {
+      "matchManagers": ["custom.regex"],
+      "matchDepNames": ["ghcr.io/paperless-ngx/paperless-ngx"],
+      "commitMessageTopic": "Paperless-ngx",
+      "addLabels": ["paperless"],
+      "postUpgradeTasks": {
+        "commands": ["node .github/scripts/renovate-paperless-bump.mjs"],
+        "fileFilters": ["site/**"],
+        "executionMode": "branch"
+      }
+    }
+  ]
+}
