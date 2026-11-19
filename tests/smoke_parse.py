@@ -29,7 +29,7 @@ from paperless_vlm_ocr.parser import VlmOcrParser
 
 PDF = Path("/tmp/smoke-parse.pdf")
 DECISIONS = Path(os.environ["PAPERLESS_VLM_OCR_DECISION_LOG"])
-LINES = ("PAPERLESS VLM OCR", "SMOKE TEST PAGE", "KONTOINHABER", "IBAN DE89 3704 0044")
+LINES = ("PAPERLESS VLM OCR", "SMOKE TEST PAGE", "KONTOINHABER", "IBAN DE00 0000 0000")
 
 
 def write_scan(path: Path) -> None:

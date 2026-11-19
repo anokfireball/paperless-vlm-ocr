@@ -50,10 +50,59 @@ model (in both modes). Pages whose reference read is too short are `no_signal`;
 in `enforce` they are transcribed, and the model text replaces the layer unless
 the layer agrees with it.
 
-Model output is rejected (and the fallback used) when it is truncated
-(`finish_reason=length`), empty, repetitive, or a runaway expansion. Any
-exception inside the added logic is logged and the stock Tesseract/layer result
-is kept: the plugin fails open.
+## Output checks
+
+Model output is checked before it replaces the layer:
+
+- A **periodic run** is a unit of 1-120 characters repeated at least 8 times
+  and at least 200 characters long; it is degenerate generation, not content.
+  The detector works inside one long line and across lines. The text before the
+  line containing the loop start is kept as `loop_cut` when the fallback is at
+  least 200 characters and that prefix covers at least 60% of it (for one tile,
+  60% of that tile's 1/N share of the page fallback); otherwise the call is
+  rejected as `repetition`.
+- `finish_reason=length` is `truncated`.
+- Fewer than 20 characters against a fallback of at least 50 is `empty`.
+- More than `2.8 * fallback + 300` characters (fallback at least 200) is a
+  `runaway` expansion.
+
+A call rejected as `truncated`, `repetition` or `empty` is retried once for that
+page only; `attempts` and the token counts then cover both calls. `runaway`
+rejections and exceptions are not retried (transport retries stay in the
+client).
+
+Each parse has a wall-clock budget that counts from the start of `parse()`, so
+OCRmyPDF and the reference reads are included, and that is capped by the Celery
+task limit minus 120 s for post-processing:
+`deadline = start + min(DOC_BUDGET_S, CELERY_TASK_TIME_LIMIT - 120)`, with
+`DOC_BUDGET_S` defaulting to 900 s and the task limit to 1800 s. When the budget
+is already exhausted, Tesseract reference reads are skipped and pages with a
+layer are kept (`decision=keep`, reason `budget`). Before every model call -
+first call, retry and each tile - the remaining budget is checked; when it is
+exhausted the page falls back with reason `budget` instead of calling. Per-call
+timeouts and transport retries are capped so they cannot overrun the budget,
+and the extra retry is skipped when less than one timeout is left.
+
+### Tall pages
+
+A rendered page with height/width > 2.5 is cut into
+`ceil((height / width) / 2)` tiles. The page is rasterised once so that each
+tile's long side is about `IMAGE_PX` (full page height ~= tiles * `IMAGE_PX`,
+capped at 10000 px). Each seam goes inside whitespace: within 6% of the tile
+height of the nominal boundary, a blank row run of at least 8 px (row ink <= 12
+of 255) is used, and the cut is the blank row nearest the boundary. If the band
+has no blank run, the least-inked row is used. The next tile starts on the cut
+row and the previous tile keeps the first complete text line below it, so
+exactly one whole line is shared across the seam; tiles are transcribed
+sequentially (pages stay parallel). `join_tiles` removes that line: up to two
+leading lines of the next tile are dropped when they equal (after whitespace
+normalisation), are fuzzy-equal (difflib ratio >= 0.85), or one is a prefix of
+the other; the previous tile's version wins unless the next tile's line is
+strictly longer. A failed or rejected tile rejects the whole page with that
+tile's reason. Image inputs get the same treatment.
+
+Any exception inside the added logic is logged and the stock Tesseract/layer
+result is kept: the plugin fails open.
 
 ## Compatibility guard
 
@@ -104,7 +153,7 @@ controllers:
 persistence:
   vlmocr:
     type: image
-    image: ghcr.io/anokfireball/paperless-vlm-ocr:0.2.0
+    image: ghcr.io/anokfireball/paperless-vlm-ocr:0.3.0
     globalMounts:
       - path: /usr/src/paperless/vlm-ocr
         readOnly: true
@@ -149,9 +198,10 @@ All settings come from the environment and are read on every parse.
 | `PAPERLESS_VLM_OCR_GATE_THRESHOLD` | `0.9` | Agreement threshold for `coverage`/`support` |
 | `PAPERLESS_VLM_OCR_GATE_MIN_TOKENS` | `15` | Minimum tokens for a layer/reference to be judged |
 | `PAPERLESS_VLM_OCR_TIMEOUT_S` | `120` | Request timeout in seconds |
+| `PAPERLESS_VLM_OCR_DOC_BUDGET_S` | `900` | Wall-clock budget for one parse, counted from the start of `parse()` (seconds) |
 | `PAPERLESS_VLM_OCR_CONCURRENCY` | `4` | Parallel model requests per document |
 | `PAPERLESS_VLM_OCR_MAX_PAGES` | `50` | Documents with more pages are left untouched |
-| `PAPERLESS_VLM_OCR_IMAGE_PX` | `1800` | Long side of the page image sent to the model |
+| `PAPERLESS_VLM_OCR_IMAGE_PX` | `1800` | Long side of each page/tile image sent to the model |
 | `PAPERLESS_VLM_OCR_DECISION_LOG` | `<DATA_DIR>/vlm-ocr/decisions.jsonl` | JSONL decision log path |
 
 ## Logging
@@ -166,22 +216,30 @@ summary per document (`file` is the name only, `sha` its first 12 hex digits):
 
 ```
 vlm_ocr start file=statement.pdf sha=a1b2c3d4e5f6 mime=application/pdf pages=5 archive=yes gate_mode=shadow threshold=0.90 model=vision-model
-vlm_ocr page 2/5 sha=a1b2c3d4e5f6 kind=gated decision=keep coverage=0.987 support=0.991 threshold=0.90 layer_tokens=120 ref_tokens=118 source=layer reason=-
-vlm_ocr page 1/5 sha=a1b2c3d4e5f6 kind=empty_layer decision=vlm coverage=- support=- threshold=0.90 layer_tokens=0 ref_tokens=- source=vlm reason=- vlm_vs_fallback_coverage=0.941 vlm_vs_fallback_support=0.933
-vlm_ocr page 4/5 sha=a1b2c3d4e5f6 kind=gated decision=vlm coverage=0.312 support=0.298 threshold=0.90 layer_tokens=87 ref_tokens=95 source=tesseract reason=RuntimeError
-vlm_ocr llm page=1 sha=a1b2c3d4e5f6 model=vision-model host=api.example.test attempts=2 finish_reason=stop tokens_in=1700 tokens_out=420 seconds=12.3 image=1800x2546 bytes=731003 chars=51 response_id=chatcmpl-abc request_id=req-123
-vlm_ocr llm page=3 sha=a1b2c3d4e5f6 model=vision-model host=api.example.test failed error=APIStatusError status=429 request_id=req-999 seconds=3.5
-vlm_ocr llm page=2 sha=a1b2c3d4e5f6 model=vision-model host=api.example.test attempts=2 finish_reason=stop tokens_in=1700 tokens_out=420 seconds=12.3 image=1800x2546 bytes=731003 chars=167 response_id=chatcmpl-abc request_id=req-123 rejected reason=repetition fallback_chars=812
-vlm_ocr summary file=statement.pdf sha=a1b2c3d4e5f6 pages=5 keep=2 vlm=2 fallback=1 would_vlm=0 no_signal=0 gate_mode=shadow threshold=0.90 coverage_min=0.312 coverage_mean=0.649 support_min=0.298 support_mean=0.644 sources=LLVTL content=assembled tokens_in=1700 tokens_out=420 seconds=18.0
+vlm_ocr page 2/5 sha=a1b2c3d4e5f6 kind=gated decision=keep coverage=0.987 support=0.991 threshold=0.90 layer_tokens=120 ref_tokens=118 source=layer reason=- tiles=1 loop_at=-
+vlm_ocr page 1/5 sha=a1b2c3d4e5f6 kind=empty_layer decision=vlm coverage=- support=- threshold=0.90 layer_tokens=0 ref_tokens=- source=vlm reason=- vlm_vs_fallback_coverage=0.941 vlm_vs_fallback_support=0.933 tiles=1 loop_at=-
+vlm_ocr page 4/5 sha=a1b2c3d4e5f6 kind=gated decision=vlm coverage=0.312 support=0.298 threshold=0.90 layer_tokens=87 ref_tokens=95 source=tesseract reason=RuntimeError tiles=1 loop_at=-
+vlm_ocr page 3/5 sha=a1b2c3d4e5f6 kind=empty_layer decision=vlm coverage=- support=- threshold=0.90 layer_tokens=0 ref_tokens=- source=vlm reason=loop_cut vlm_vs_fallback_coverage=0.812 vlm_vs_fallback_support=0.774 tiles=3 loop_at=533
+vlm_ocr llm page=1 sha=a1b2c3d4e5f6 model=vision-model host=api.example.test attempts=2 finish_reason=stop tokens_in=1700 tokens_out=420 seconds=12.3 image=1800x2546 bytes=731003 chars=47 response_id=chatcmpl-abc request_id=req-123 tiles=1 reason=- loop_at=-
+vlm_ocr llm page=3 sha=a1b2c3d4e5f6 model=vision-model host=api.example.test failed error=APIStatusError status=429 request_id=req-999 seconds=3.5 tiles=1
+vlm_ocr llm page=2 sha=a1b2c3d4e5f6 model=vision-model host=api.example.test attempts=2 finish_reason=stop tokens_in=1700 tokens_out=420 seconds=12.3 image=1800x2546 bytes=731003 chars=167 response_id=chatcmpl-abc request_id=req-123 rejected reason=repetition fallback_chars=812 tiles=1 loop_at=-
+vlm_ocr llm page=3 sha=a1b2c3d4e5f6 model=vision-model host=api.example.test attempts=3 finish_reason=length tokens_in=2600 tokens_out=640 seconds=18.7 image=1042x1802 bytes=642110 chars=1240 response_id=chatcmpl-def request_id=req-456 tiles=3 reason=loop_cut loop_at=533
+vlm_ocr summary file=statement.pdf sha=a1b2c3d4e5f6 pages=5 keep=3 vlm=1 fallback=1 would_vlm=0 no_signal=0 gate_mode=shadow threshold=0.90 coverage_min=0.312 coverage_mean=0.649 support_min=0.298 support_mean=0.644 sources=LLVTL content=assembled tokens_in=4300 tokens_out=1060 seconds=18.0 budget_exhausted=no
 ```
 
 - `coverage`/`support` are `-` when the page has no reference read; `reason` is
-  a fallback or rejection reason, or the exception class of a failed attempt.
+  the final reason: `loop_cut` when a prefix was kept, otherwise a rejection or
+  fallback reason, or the exception class of a failed attempt.
+- `tiles` is the number of tiles the page was split into (1 for a normal page);
+  `loop_at` is the offset of the detected loop inside that call's text (`-` when
+  none).
 - `vlm_vs_fallback_*` compares the model text with the text it displaced, so a
   suspicious `source=vlm` page is visible without opening the document.
 - The summary's `sources` has one letter per page (`L` layer, `V` model,
   `T` Tesseract) and `content` says whether `document.text` was rewritten
-  (`assembled`) or left as the parent parser produced it (`parent`).
+  (`assembled`) or left as the parent parser produced it (`parent`);
+  `budget_exhausted=yes` means at least one page stopped on the document
+  budget (its reason is `budget`).
 - Lines never contain the API key, the endpoint path or query, request bodies or
   transcribed text: failures report the exception class, HTTP status and request
   id, while calls - accepted or rejected - report attempts, sizes, token counts
@@ -198,14 +256,18 @@ One JSON line per page, appended whether or not anything changed:
 `output_tokens`, `model`, `finish_reason`, `attempts`, `response_id`,
 `request_id`, `payload_bytes`, `image_px`, `vlm_chars`, `fallback_chars`,
 `layer_chars`, `vlm_vs_fallback_coverage`, `vlm_vs_fallback_support`,
-`error_status`, `gate_mode`, `plugin_version`.
+`error_status`, `gate_mode`, `plugin_version`, `tiles`, `loop_at`, `reason`.
 
-`fallback_reason` carries a rejection reason, a fallback failure, or the
-exception class of a failed model call (with its HTTP status in `error_status`);
-`attempts` counts the first request plus retries, and `response_id`/
-`request_id` identify the call upstream. A failing log write is a warning, never
-a parse failure. Use the `sha256` to map a record back with
-`Document.objects.filter(checksum=...)`.
+`fallback_reason` carries a rejection reason (including `budget` when the
+document budget stopped the page), a fallback failure, or the exception class of
+a failed model call (with its HTTP status in `error_status`);
+`reason` is the final outcome (`loop_cut` for an accepted prefix, `budget` when
+the document budget stopped the page, otherwise the same value as
+`fallback_reason`). `tiles` and `loop_at` mirror the log line;
+`attempts` counts the first request plus retries (including a second call for a
+rejected page), and `response_id`/`request_id` identify the last call upstream.
+A failing log write is a warning, never a parse failure. Use the `sha256` to map
+a record back with `Document.objects.filter(checksum=...)`.
 
 ## Offline gate scan
 
