@@ -41,16 +41,13 @@ from paperless_vlm_ocr.pages import render_png
 from paperless_vlm_ocr.pages import tesseract_text
 from paperless_vlm_ocr.vlm import VlmClient
 from paperless_vlm_ocr.vlm import VlmResult
-from paperless_vlm_ocr.vlm import call_timeout
 from paperless_vlm_ocr.vlm import clean
 from paperless_vlm_ocr.vlm import combine_results
 from paperless_vlm_ocr.vlm import deadline_from
-from paperless_vlm_ocr.vlm import evaluate
 from paperless_vlm_ocr.vlm import format_llm_failure_line
 from paperless_vlm_ocr.vlm import format_llm_line
 from paperless_vlm_ocr.vlm import format_llm_rejection_line
-from paperless_vlm_ocr.vlm import may_retry
-from paperless_vlm_ocr.vlm import transport_retries
+from paperless_vlm_ocr.vlm import transcribe_with_retry
 
 LOGGER_NAME = "paperless.parsing.vlm_ocr"
 logger = logging.getLogger(LOGGER_NAME)
@@ -60,7 +57,6 @@ Source = Literal["layer", "vlm", "tesseract"]
 _REJECT_REASONS = frozenset(
     {"truncated", "empty", "repetition", "runaway", "budget"}
 )
-_RETRY_REASONS = frozenset({"truncated", "repetition", "empty"})
 
 _warned: set[str] = set()
 
@@ -499,38 +495,24 @@ class VlmOcrParser(RasterisedDocumentParser):
         share: float,
         deadline: float,
     ) -> tuple[VlmResult | None, str | None, str | None, int | None]:
-        """One tile: one call, plus one retry on a retryable rejection.
+        """One tile: one paid call plus at most one retry, within the budget.
 
-        A call is only started when the document budget can still cover it;
-        otherwise the tile reports ``budget`` and the page falls back. Per-call
-        timeouts and transport retries are capped by the same budget.
-        Transport retries stay inside the client; the retry here is only for a
-        paid-for answer that the evaluator rejected. Returns the merged call
-        record, the accepted text (or None), the reason and the loop offset.
+        Transport retries are disabled at the client; the retry policy (a
+        rejected result or a transient API error, never a timeout) lives in
+        ``transcribe_with_retry``.
         """
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return None, None, "budget", None
-        timeout_s = self.cfg.timeout_s
         data = png.read_bytes()
-        result = client.transcribe(
-            data,
-            timeout=call_timeout(remaining, timeout_s),
-            max_retries=transport_retries(remaining, timeout_s),
+
+        def transcribe(timeout: float) -> VlmResult:
+            return client.transcribe(data, timeout=timeout)
+
+        return transcribe_with_retry(
+            transcribe,
+            fallback,
+            share=share,
+            timeout_s=self.cfg.timeout_s,
+            remaining=lambda: deadline - time.monotonic(),
         )
-        text, reason, loop_at = evaluate(result, fallback, share=share)
-        results = [result]
-        if text is None and reason in _RETRY_REASONS:
-            remaining = deadline - time.monotonic()
-            if may_retry(remaining, timeout_s):
-                result = client.transcribe(
-                    data,
-                    timeout=call_timeout(remaining, timeout_s),
-                    max_retries=transport_retries(remaining, timeout_s),
-                )
-                text, reason, loop_at = evaluate(result, fallback, share=share)
-                results.append(result)
-        return combine_results(results), text, reason, loop_at
 
     def _render_vlm_tiles(
         self,

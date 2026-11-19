@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -24,11 +25,17 @@ PROMPT = (
 )
 USER_TEXT = "Transcribe this page."
 
+# Output cap: a looping page truncates at ~4k tokens instead of running into
+# the per-call timeout. Accepted pages are p99 2,057 output tokens.
+MAX_TOKENS = 4096
+
 # Loop detector: a unit of 1-200 characters repeated at least 8 times and at
 # least 400 characters long is degenerate generation, not content.
 MAX_PERIOD = 200
 MIN_REPEATS = 8
 MIN_LOOP_CHARS = 400
+# Rejections worth one more paid call; runaway and errors are not.
+RETRY_REASONS = frozenset({"truncated", "repetition", "empty"})
 # A cut prefix is kept when it covers this much of the expected page text.
 LOOP_CUT_RATIO = 0.6
 # Runaway guard: text far longer than the fallback is an expansion.
@@ -60,15 +67,6 @@ def may_retry(remaining: float, timeout_s: float) -> bool:
     return remaining >= timeout_s
 
 
-def transport_retries(remaining: float, timeout_s: float) -> int:
-    """Transport retries whose worst case (attempts * timeout) fits the budget."""
-    if remaining < 2 * timeout_s:
-        return 0
-    if remaining < 3 * timeout_s:
-        return 1
-    return 2
-
-
 @dataclass
 class VlmResult:
     text: str
@@ -94,7 +92,7 @@ class VlmClient:
             base_url=cfg.endpoint,
             api_key=cfg.api_key,
             timeout=cfg.timeout_s,
-            max_retries=2,
+            max_retries=0,
         )
 
     def transcribe(
@@ -102,22 +100,16 @@ class VlmClient:
         png_bytes: bytes,
         *,
         timeout: float | None = None,
-        max_retries: int | None = None,
     ) -> VlmResult:
         data = base64.b64encode(png_bytes).decode("ascii")
         client = self._client
-        options: dict[str, float | int] = {}
         if timeout is not None:
-            options["timeout"] = timeout
-        if max_retries is not None:
-            options["max_retries"] = max_retries
-        if options:
-            client = client.with_options(**options)
+            client = client.with_options(timeout=timeout)
         started = time.monotonic()
         raw = client.chat.completions.with_raw_response.create(
             model=self._cfg.model,
             temperature=0,
-            max_tokens=8192,
+            max_tokens=MAX_TOKENS,
             messages=[
                 {"role": "system", "content": PROMPT},
                 {
@@ -355,3 +347,61 @@ def reject_reason(result: VlmResult, fallback_text: str) -> str | None:
     """Return why a VLM transcription is unusable, or None if it is fine."""
     text, reason, _ = evaluate(result, fallback_text)
     return None if text is not None else reason
+
+
+def retryable_error(error: BaseException) -> bool:
+    """Whether one more call can plausibly succeed after this exception.
+
+    A timeout repeats the same doomed generation, so it is never retried.
+    Connection errors and HTTP 429/5xx are transient; other HTTP errors (for
+    example a 400 from a bad request) are not.
+    """
+    name = type(error).__name__
+    if name == "APITimeoutError":
+        return False
+    if name == "APIConnectionError":
+        return True
+    status = getattr(error, "status_code", None)
+    if isinstance(status, int):
+        return status == 429 or 500 <= status < 600
+    return False
+
+
+def transcribe_with_retry(
+    transcribe: Callable[[float], VlmResult],
+    fallback: str,
+    *,
+    share: float,
+    timeout_s: float,
+    remaining: Callable[[], float],
+) -> tuple[VlmResult | None, str | None, str | None, int | None]:
+    """One tile: one paid call, plus at most one retry within the budget.
+
+    ``transcribe`` receives the per-call timeout and may raise; a transient
+    error (not a timeout) is retried once when a full timeout still fits. A
+    result rejected as truncated, repetition or empty is retried the same way.
+    Returns the merged call record, the accepted text (or None), the reason and
+    the loop offset; returns reason ``budget`` without calling when the
+    document budget is exhausted. Exceptions that are not retried propagate.
+    """
+    left = remaining()
+    if left <= 0:
+        return None, None, "budget", None
+    try:
+        result = transcribe(call_timeout(left, timeout_s))
+    except Exception as error:
+        left = remaining()
+        if not retryable_error(error) or not may_retry(left, timeout_s):
+            raise
+        result = transcribe(call_timeout(left, timeout_s))
+        text, reason, loop_at = evaluate(result, fallback, share=share)
+        return combine_results([result]), text, reason, loop_at
+    text, reason, loop_at = evaluate(result, fallback, share=share)
+    results = [result]
+    if text is None and reason in RETRY_REASONS:
+        left = remaining()
+        if may_retry(left, timeout_s):
+            result = transcribe(call_timeout(left, timeout_s))
+            text, reason, loop_at = evaluate(result, fallback, share=share)
+            results.append(result)
+    return combine_results(results), text, reason, loop_at

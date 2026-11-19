@@ -34,7 +34,7 @@ class VlmOcrConfig:
     gate_mode: Literal["shadow", "enforce"] = "shadow"
     threshold: float = 0.9
     min_tokens: int = 15
-    timeout_s: float = 120.0
+    timeout_s: float = 240.0
     doc_budget_s: float = 900.0
     concurrency: int = 4
     max_pages: int = 50
@@ -53,7 +53,7 @@ class VlmOcrConfig:
             gate_mode="enforce" if mode == "enforce" else "shadow",
             threshold=float(_env("GATE_THRESHOLD", "0.9")),
             min_tokens=int(_env("GATE_MIN_TOKENS", "15")),
-            timeout_s=float(_env("TIMEOUT_S", "120")),
+            timeout_s=float(_env("TIMEOUT_S", "240")),
             doc_budget_s=float(_env("DOC_BUDGET_S", "900")),
             concurrency=int(_env("CONCURRENCY", "4")),
             max_pages=int(_env("MAX_PAGES", "50")),
