@@ -14,6 +14,10 @@ if TYPE_CHECKING:
 
 _WORD = re.compile(r"[^\W_]+")
 
+# A layer the reference read barely confirms is fabricated noise, however much
+# of the reference it happens to contain by sheer volume.
+MIN_SUPPORT = 0.2
+
 
 def tokenize(text: str) -> list[str]:
     """Casefolded alphanumeric tokens.
@@ -58,15 +62,18 @@ def agreement(layer: list[str], ref: list[str]) -> tuple[float, float]:
 
 
 def passes(coverage: float, support: float, threshold: float) -> bool:
-    """Keep a layer that covers the reference, or nearly covers it and is confirmed.
+    """Keep a layer that the reference read confirms and that covers it.
 
-    Coverage is the primary signal: split, letter-spaced, garbled or missing
-    layer text lowers it. Low support alone mostly means Tesseract missed
-    light or small print, so support only counts within 0.1 below threshold.
+    A support floor rejects a huge, mostly fabricated layer that covers the
+    reference only by volume. Above the floor, coverage is the primary signal:
+    split, letter-spaced, garbled or missing layer text lowers it; low support
+    alone mostly means Tesseract missed light or small print, so support only
+    counts within 0.1 below threshold.
     """
-    if coverage >= threshold:
-        return True
-    return coverage >= threshold - 0.1 and support >= threshold
+    return support >= MIN_SUPPORT and (
+        coverage >= threshold
+        or (coverage >= threshold - 0.1 and support >= threshold)
+    )
 
 
 @dataclass

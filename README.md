@@ -26,12 +26,15 @@ shared tokens / layer tokens, a page with at least `GATE_MIN_TOKENS` tokens on
 both sides keeps its layer when
 
 ```
-keep if coverage >= threshold
-     or (coverage >= threshold - margin and support >= threshold)
+keep if support >= MIN_SUPPORT
+    and (
+        coverage >= threshold
+        or (coverage >= threshold - margin and support >= threshold)
+    )
 ```
 
-`threshold` is `PAPERLESS_VLM_OCR_GATE_THRESHOLD`; `margin` and the tokenisation
-rule are constants in `gate.py`. Otherwise:
+`threshold` is `PAPERLESS_VLM_OCR_GATE_THRESHOLD`; `MIN_SUPPORT`, `margin` and
+the tokenisation rule are constants in `gate.py`. Otherwise:
 
 | Page state | `shadow` (default) | `enforce` |
 |---|---|---|
