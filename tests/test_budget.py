@@ -5,7 +5,6 @@ from __future__ import annotations
 from paperless_vlm_ocr.vlm import call_timeout
 from paperless_vlm_ocr.vlm import deadline_from
 from paperless_vlm_ocr.vlm import may_retry
-from paperless_vlm_ocr.vlm import transport_retries
 
 
 def test_deadline_uses_the_document_budget_when_the_limit_is_large() -> None:
@@ -45,12 +44,3 @@ def test_may_retry_needs_a_full_timeout() -> None:
     assert may_retry(120.0, 120.0)
     assert not may_retry(119.9, 120.0)
     assert not may_retry(0.0, 120.0)
-
-
-def test_transport_retries_fit_the_remaining_budget() -> None:
-    # worst case (retries + 1) * timeout must not exceed the remaining budget
-    assert transport_retries(239.9, 120.0) == 0
-    assert transport_retries(240.0, 120.0) == 1
-    assert transport_retries(359.9, 120.0) == 1
-    assert transport_retries(360.0, 120.0) == 2
-    assert transport_retries(900.0, 120.0) == 2

@@ -63,10 +63,13 @@ Each output is checked before it can replace a page:
 - Empty: output with no real text against a non-trivial fallback is `empty`.
 - Runaway: output much longer than the fallback is `runaway`.
 
-The loop and runaway limits are constants in `vlm.py`. `truncated`,
-`repetition` and `empty` are retried, and `attempts` then covers both paid
-calls. `runaway` and transport errors are not retried beyond the client's own
-retries.
+The loop, runaway and output-cap limits are constants in `vlm.py`. A per-call
+output limit (`MAX_TOKENS`) truncates a looping generation, so it does not keep
+generating until the per-call timeout, which defaults to
+`PAPERLESS_VLM_OCR_TIMEOUT_S`. The client does not retry; the plugin makes at
+most one retry for a rejected transcription (a detected loop, `truncated` or
+`empty`) or for a transient transport error (connection failure or HTTP
+429/5xx), and never after a timeout. `attempts` covers both paid calls.
 
 ### Tall pages
 
@@ -83,9 +86,9 @@ includes OCRmyPDF and the reference reads. `DOC_BUDGET_S` sets it, capped at the
 Celery task limit minus a safety margin (constant in `vlm.py`). If the budget
 is used up before the reference reads, they are skipped and pages with a layer
 are kept with reason `budget`. Before every model call, including each tile and
-the retry, the remaining time is checked. Per-call timeouts and transport
-retries are capped so they cannot exceed it, and the retry is skipped when the
-remaining time cannot cover a full timeout.
+the retry, the remaining time is checked. Per-call timeouts are capped so they
+cannot exceed it, and the retry is skipped when the remaining time cannot cover
+a full timeout.
 
 ## Installation
 
@@ -249,8 +252,8 @@ anything changed. A failed write is a warning, never a parse failure. Use
 
 `fallback_reason` is a rejection reason, `budget`, `ref_error` or the exception
 class of the failed call (with its HTTP status in `error_status`). `reason` is
-the final outcome. `attempts` counts the first call plus the retry and
-transport retries, and the ids identify the last call upstream.
+the final outcome. `attempts` counts every paid call made for the page,
+retries included, and the ids identify the last call upstream.
 
 The API key, the endpoint path/query/userinfo (only the host is logged),
 request bodies and transcriptions never appear in the logs or the decision
