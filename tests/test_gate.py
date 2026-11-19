@@ -89,6 +89,43 @@ def test_passes_keeps_layer_tesseract_under_reads() -> None:
     assert passes(0.989, 0.472, 0.9)
 
 
+def test_passes_keeps_full_coverage_with_confirmed_support() -> None:
+    assert passes(1.0, 0.9, 0.9)
+
+
+def test_passes_rejects_a_fabricated_layer_with_high_coverage() -> None:
+    # doc 702: a ~65k-token junk layer covers the reference by volume
+    assert not passes(0.995, 0.016, 0.9)
+
+
+def test_passes_support_floor_boundary() -> None:
+    assert passes(1.0, 0.2, 0.9)
+    assert not passes(1.0, 0.19, 0.9)
+
+
+def test_passes_keeps_confirmed_layer_below_coverage() -> None:
+    # coverage slightly low but every layer token is confirmed (doc 1028 p2)
+    assert passes(0.85, 0.95, 0.9)
+
+
+def test_classify_fabricated_layer_is_would_vlm_in_shadow() -> None:
+    ref = [f"ref{i}" for i in range(60)]
+    layer = ref + [f"junk{i}" for i in range(3690)]
+    verdict = classify(" ".join(layer), " ".join(ref), _cfg(gate_mode="shadow"))
+    assert verdict.coverage == 1.0
+    assert verdict.support < 0.02
+    assert verdict.decision == "would_vlm"
+
+
+def test_classify_fabricated_layer_goes_to_vlm_in_enforce() -> None:
+    ref = [f"ref{i}" for i in range(60)]
+    layer = ref + [f"junk{i}" for i in range(3690)]
+    verdict = classify(" ".join(layer), " ".join(ref), _cfg(gate_mode="enforce"))
+    assert verdict.coverage == 1.0
+    assert verdict.support < 0.02
+    assert verdict.decision == "vlm"
+
+
 def test_passes_rejects_split_words_with_high_coverage() -> None:
     # partially split words (docs 1880 p4, 694): coverage below threshold
     assert not passes(0.875, 0.768, 0.9)
