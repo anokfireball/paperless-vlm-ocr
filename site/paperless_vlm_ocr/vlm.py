@@ -24,11 +24,11 @@ PROMPT = (
 )
 USER_TEXT = "Transcribe this page."
 
-# Loop detector: a unit of 1-120 characters repeated at least 8 times and at
-# least 200 characters long is degenerate generation, not content.
-MAX_PERIOD = 120
+# Loop detector: a unit of 1-200 characters repeated at least 8 times and at
+# least 400 characters long is degenerate generation, not content.
+MAX_PERIOD = 200
 MIN_REPEATS = 8
-MIN_LOOP_CHARS = 200
+MIN_LOOP_CHARS = 400
 # A cut prefix is kept when it covers this much of the expected page text.
 LOOP_CUT_RATIO = 0.6
 # Runaway guard: text far longer than the fallback is an expansion.

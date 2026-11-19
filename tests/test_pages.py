@@ -100,7 +100,7 @@ def test_tile_seams_accept_tight_gaps() -> None:
     ink = row_ink(img)
     assert seams == [400, 800]
     for row, length in zip(seams, (8, 30)):
-        assert ink[row] == 0
+        assert ink[row] <= 12
         start = row
         while start > 0 and ink[start - 1] <= 12:
             start -= 1
@@ -119,7 +119,7 @@ def test_tile_seams_cut_inside_blank_runs() -> None:
     seams = tile_seams(img, 3)
     ink = row_ink(img)
     assert seams == [400, 800]
-    assert all(ink[row] == 0 for row in seams)
+    assert all(ink[row] <= 12 for row in seams)
 
 
 def test_tiles_share_exactly_one_complete_line() -> None:
@@ -147,7 +147,7 @@ def test_tiles_share_exactly_one_complete_line() -> None:
         assert len(shared) == 1, (index, shared)
 
 
-def test_tile_bounds_share_the_next_line_after_a_dense_cut() -> None:
+def test_tile_bounds_end_at_a_cut_inside_ink() -> None:
     pytest.importorskip("PIL.Image")
     from paperless_vlm_ocr.pages import row_ink
     from paperless_vlm_ocr.pages import tile_bounds
@@ -155,9 +155,9 @@ def test_tile_bounds_share_the_next_line_after_a_dense_cut() -> None:
     img = _seam_page()
     bounds = tile_bounds(img, [350, 800])
     lines = _line_runs(row_ink(img))
-    # the cut is inside the 320-379 line, so that line is clipped; the next
-    # complete line below it (480-539) is shared
-    assert bounds[0] == (0, 540)
+    # 350 cuts through the 320-379 line: the seam is misplaced, so tile 0
+    # ends at the cut and nothing is extended past it
+    assert bounds == [(0, 350), (350, 940), (800, 1200)]
     shared = [
         line
         for line in lines
@@ -166,7 +166,63 @@ def test_tile_bounds_share_the_next_line_after_a_dense_cut() -> None:
         and bounds[1][0] <= line[0]
         and line[1] < bounds[1][1]
     ]
-    assert shared == [(480, 539)]
+    assert shared == []
+
+
+def test_tile_bounds_cap_a_long_shared_run() -> None:
+    pytest.importorskip("PIL.Image")
+    from PIL import Image
+    from PIL import ImageDraw
+
+    from paperless_vlm_ocr.pages import tile_bounds
+
+    def page(block_height: int):
+        img = Image.new("L", (200, 1200), 255)
+        draw = ImageDraw.Draw(img)
+        draw.rectangle((10, 40, 190, 69), fill=0)  # line above the gap
+        draw.rectangle((10, 120, 190, 120 + block_height - 1), fill=0)
+        draw.rectangle(
+            (10, 120 + block_height + 20, 190, 120 + block_height + 69),
+            fill=0,
+        )
+        return img
+
+    # a short run (one text line) is shared across the seam
+    assert tile_bounds(page(30), [110]) == [(0, 150), (110, 1200)]
+    # a tall run (QR/barcode/photo) is not shared: the tiles meet at the cut
+    assert tile_bounds(page(476), [110]) == [(0, 110), (110, 1200)]
+
+
+def test_tile_bounds_do_not_span_a_containing_run() -> None:
+    pytest.importorskip("PIL.Image")
+    from PIL import Image
+    from PIL import ImageDraw
+
+    from paperless_vlm_ocr.pages import row_ink
+    from paperless_vlm_ocr.pages import tile_bounds
+    from paperless_vlm_ocr.pages import tile_seams
+
+    img = Image.new("L", (200, 1200), 255)
+    draw = ImageDraw.Draw(img)
+    # a 600 px ink run spans the nominal cut at 600, with one lighter row
+    draw.rectangle((10, 400, 190, 999), fill=100)
+    draw.rectangle((10, 620, 190, 620), fill=200)
+    # a short run follows after a blank gap
+    draw.rectangle((10, 1100, 190, 1129), fill=0)
+
+    seams = tile_seams(img, 2)
+    ink = row_ink(img)
+    reach = round(img.height / 2 * 0.06)
+    lo = max(1, 600 - reach)
+    hi = min(img.height - 1, 600 + reach)
+    assert seams == [620]
+    assert ink[seams[0]] == min(ink[lo : hi + 1])  # least-ink fallback
+    assert ink[seams[0]] > 12  # the cut is inside the long run
+
+    bounds = tile_bounds(img, seams)
+    # the seam is misplaced: no extension across the containing run
+    assert bounds == [(0, 620), (620, 1200)]
+    assert bounds[0][1] - seams[0] <= 250
 
 
 def test_tile_seams_fall_back_to_the_least_ink_row() -> None:

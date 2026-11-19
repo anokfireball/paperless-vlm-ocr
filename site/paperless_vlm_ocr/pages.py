@@ -18,13 +18,15 @@ if TYPE_CHECKING:
 _TIMEOUT_S = 180
 
 # Tall-page tiling: split above this height/width ratio into ~2:1 tiles. Seams
-# go inside a blank run of at least _MIN_GAP_PX rows; the previous tile keeps
-# the first complete line below the seam, so one whole line is shared.
+# go inside a blank run of at least _MIN_GAP_PX rows (mean ink <= _BLANK_INK);
+# the previous tile keeps the first complete line below the seam when the cut is
+# blank and that run is at most _MAX_SHARED_RUN_PX tall.
 _TILE_RATIO = 2.5
 _TILE_ASPECT = 2.0
 _CUT_SEARCH = 0.06
 _BLANK_INK = 12
 _MIN_GAP_PX = 8
+_MAX_SHARED_RUN_PX = 250
 _MAX_RENDER_PX = 10000
 
 # Seam dedup: at most two lines per seam, fuzzy match threshold.
@@ -161,9 +163,10 @@ def _runs(
 def tile_seams(img: Image.Image, tiles: int) -> list[int]:
     """Cut rows inside a blank run near each nominal tile boundary.
 
-    The run must be at least ``_MIN_GAP_PX`` rows and the cut is the row nearest
-    the nominal boundary. Without a blank run in the search band the least-inked
-    row is used; ``split_tiles`` still shares one complete line across the seam.
+    A row is blank when its mean ink is at most ``_BLANK_INK``; the run must be
+    at least ``_MIN_GAP_PX`` rows and the cut is the row nearest the nominal
+    boundary. Without a blank run in the search band the least-inked row is
+    used.
     """
     ink = row_ink(img)
     gaps = [
@@ -202,9 +205,11 @@ def tile_seams(img: Image.Image, tiles: int) -> list[int]:
 
 def tile_bounds(img: Image.Image, cuts: Sequence[int]) -> list[tuple[int, int]]:
     """Row bounds of the tiles: the next tile starts on the cut row and the
-    previous tile keeps the first complete ink run below it.
+    previous tile keeps the first complete text line below it when the cut is
+    blank and that run is at most ``_MAX_SHARED_RUN_PX`` tall.
 
-    Exactly one whole text line is therefore shared across each seam.
+    A cut inside an ink run is a misplaced seam: the tile ends at the cut and
+    the next tile owns the rest of that run, so no large block is duplicated.
     """
     ink = row_ink(img)
     lines = _runs(ink, lambda value: value > _BLANK_INK)
@@ -213,9 +218,12 @@ def tile_bounds(img: Image.Image, cuts: Sequence[int]) -> list[tuple[int, int]]:
     for index in range(len(cuts) + 1):
         top = edges[index]
         bottom = edges[index + 1]
-        if index < len(cuts):
+        if index < len(cuts) and ink[bottom] <= _BLANK_INK:
             below = [line for line in lines if line[0] > bottom]
-            if below:
+            if (
+                below
+                and below[0][1] - below[0][0] + 1 <= _MAX_SHARED_RUN_PX
+            ):
                 bottom = below[0][1] + 1
         bounds.append((top, bottom))
     return bounds

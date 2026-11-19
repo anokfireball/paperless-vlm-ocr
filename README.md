@@ -1,133 +1,102 @@
 # paperless-vlm-ocr
 
 A [Paperless-ngx](https://docs.paperless-ngx.com/) parser plugin that repairs the
-text layer at ingestion time, before matching, workflows and indexing.
+text layer at ingestion time, before matching, workflows, full-text search and
+the AI index see it. Paperless trusts a born-digital PDF's text layer and only
+runs Tesseract on pages that have none, so split, letter-spaced or garbled
+layers stay broken and their text is missing from search. The plugin keeps the
+stock Tesseract parse, compares usable text layers with a fresh Tesseract read,
+and transcribes the pages that do not pass with an OpenAI-compatible vision
+model. The archive PDF is never modified; only `document.text` is replaced.
 
-Paperless normally trusts a born-digital PDF's text layer and only runs Tesseract
-on pages without one. Broken layers (split or letter-spaced bank statements,
-garbled archive conversions) therefore stay broken, while scans, receipts and
-handwriting get plain Tesseract output.
+## How it works
 
-This plugin keeps the stock Tesseract flow, then per page:
-
-1. Reads the born-digital layer (if any) and renders the original page.
-2. Runs Tesseract on the rendered page as a reference read.
-3. Keeps the layer only when it agrees with that reference; otherwise the page is
-   transcribed by an OpenAI-compatible vision model.
-4. Falls back to Tesseract (or the archive's layer) whenever the model output is
-   unusable, on API errors, or in `shadow` mode.
-
-The archive PDF is never changed: it keeps OCRmyPDF's Tesseract text layer and
-stays the fallback for search. Only `document.text` is replaced.
-
-## Gate rule
-
-Tokens are NFKC-casefolded alphanumeric runs; runs of three or more
-single-character tokens are joined (`K a r l` → `karl`), so letter-spaced layers
-still match, while wrongly split words (`Ko nto inha ber`) stay split and fail.
-
-For a page with at least `GATE_MIN_TOKENS` layer tokens and a reference read with
-at least `GATE_MIN_TOKENS` tokens, with
-
-- `coverage` = shared tokens / reference tokens,
-- `support` = shared tokens / layer tokens,
-
-the layer is kept iff
-
-```
-coverage >= threshold or (coverage >= threshold - 0.1 and support >= threshold)
+```text
+parse -> stock Tesseract parse (archive + fallback text, unchanged)
+      -> per page: born-digital layer vs. Tesseract read (when the layer has text)
+      -> gate: keep the layer | transcribe the page | keep the fallback
+      -> rebuild document.text only if at least one page changed
 ```
 
-Otherwise:
+Both texts are split into casefolded alphanumeric tokens. Runs of separately
+spaced single characters are joined (`K a r l` becomes `karl`), so
+letter-spaced layers still match, while wrongly split words (`Ko nto inha ber`)
+do not. With `coverage` = shared tokens / reference tokens and `support` =
+shared tokens / layer tokens, a page with at least `GATE_MIN_TOKENS` tokens on
+both sides keeps its layer when
 
-| `GATE_MODE` | action |
-|---|---|
-| `shadow` | keep the stored layer, log `would_vlm` |
-| `enforce` | transcribe the page with the vision model |
+```
+keep if coverage >= threshold
+     or (coverage >= threshold - margin and support >= threshold)
+```
 
-Pages with too few layer tokens are `empty_layer` and always go to the vision
-model (in both modes). Pages whose reference read is too short are `no_signal`;
-in `enforce` they are transcribed, and the model text replaces the layer unless
-the layer agrees with it.
+`threshold` is `PAPERLESS_VLM_OCR_GATE_THRESHOLD`; `margin` and the tokenisation
+rule are constants in `gate.py`. Otherwise:
 
-## Output checks
+| Page state | `shadow` (default) | `enforce` |
+|---|---|---|
+| layer passes the gate | `keep` | `keep` |
+| layer fails the gate | `would_vlm`, layer kept | `vlm`, transcribed |
+| fewer than `GATE_MIN_TOKENS` layer tokens (`empty_layer`) | `vlm`, transcribed | `vlm`, transcribed |
+| reference read too short (`no_signal`) | `no_signal`, layer kept | `vlm`; the layer wins if it agrees with the model |
 
-Model output is checked before it replaces the layer:
+`shadow` is for testing. Pages with a usable layer are left alone, but every
+page that would be sent to the model is logged.
 
-- A **periodic run** is a unit of 1-120 characters repeated at least 8 times
-  and at least 200 characters long; it is degenerate generation, not content.
-  The detector works inside one long line and across lines. The text before the
-  line containing the loop start is kept as `loop_cut` when the fallback is at
-  least 200 characters and that prefix covers at least 60% of it (for one tile,
-  60% of that tile's 1/N share of the page fallback); otherwise the call is
-  rejected as `repetition`.
-- `finish_reason=length` is `truncated`.
-- Fewer than 20 characters against a fallback of at least 50 is `empty`.
-- More than `2.8 * fallback + 300` characters (fallback at least 200) is a
-  `runaway` expansion.
+Model text replaces the layer unless the page was `no_signal` and the two
+agree. If a call fails or its output is rejected, the page falls back to the
+Tesseract reference read (gated pages), the archive's text layer (pages that
+never had one, or a Tesseract read when there is no archive) or the
+born-digital layer (`no_signal`). A failed reference read keeps the layer. If
+the plugin itself raises, it discards its work and keeps the parent parser's
+result, so ingestion does not fail because of the plugin.
 
-A call rejected as `truncated`, `repetition` or `empty` is retried once for that
-page only; `attempts` and the token counts then cover both calls. `runaway`
-rejections and exceptions are not retried (transport retries stay in the
-client).
+### Output checks
 
-Each parse has a wall-clock budget that counts from the start of `parse()`, so
-OCRmyPDF and the reference reads are included, and that is capped by the Celery
-task limit minus 120 s for post-processing:
-`deadline = start + min(DOC_BUDGET_S, CELERY_TASK_TIME_LIMIT - 120)`, with
-`DOC_BUDGET_S` defaulting to 900 s and the task limit to 1800 s. When the budget
-is already exhausted, Tesseract reference reads are skipped and pages with a
-layer are kept (`decision=keep`, reason `budget`). Before every model call -
-first call, retry and each tile - the remaining budget is checked; when it is
-exhausted the page falls back with reason `budget` instead of calling. Per-call
-timeouts and transport retries are capped so they cannot overrun the budget,
-and the extra retry is skipped when less than one timeout is left.
+Each output is checked before it can replace a page:
+
+- Loop: a unit of text that repeats many times in a row means the model is
+  looping. Text before the line where the loop starts is kept as `loop_cut`
+  when it is long enough compared with the expected page text (the ratio is a
+  constant in `vlm.py`); otherwise the output is rejected as `repetition`.
+- Truncated: `finish_reason=length` is rejected as `truncated`.
+- Empty: output with no real text against a non-trivial fallback is `empty`.
+- Runaway: output much longer than the fallback is `runaway`.
+
+The loop and runaway limits are constants in `vlm.py`. `truncated`,
+`repetition` and `empty` are retried, and `attempts` then covers both paid
+calls. `runaway` and transport errors are not retried beyond the client's own
+retries.
 
 ### Tall pages
 
-A rendered page with height/width > 2.5 is cut into
-`ceil((height / width) / 2)` tiles. The page is rasterised once so that each
-tile's long side is about `IMAGE_PX` (full page height ~= tiles * `IMAGE_PX`,
-capped at 10000 px). Each seam goes inside whitespace: within 6% of the tile
-height of the nominal boundary, a blank row run of at least 8 px (row ink <= 12
-of 255) is used, and the cut is the blank row nearest the boundary. If the band
-has no blank run, the least-inked row is used. The next tile starts on the cut
-row and the previous tile keeps the first complete text line below it, so
-exactly one whole line is shared across the seam; tiles are transcribed
-sequentially (pages stay parallel). `join_tiles` removes that line: up to two
-leading lines of the next tile are dropped when they equal (after whitespace
-normalisation), are fuzzy-equal (difflib ratio >= 0.85), or one is a prefix of
-the other; the previous tile's version wins unless the next tile's line is
-strictly longer. A failed or rejected tile rejects the whole page with that
-tile's reason. Image inputs get the same treatment.
+A page above a fixed height-to-width ratio is rendered once and split into
+tiles; the ratio and tile geometry are set in `pages.py`. Each tile's long side
+is near `IMAGE_PX`. Seams fall on blank row bands near the nominal boundary, or
+on the least-inked row. Adjacent tiles share one text line, which is removed
+when the tiles are joined. A failed or rejected tile rejects the whole page.
 
-Any exception inside the added logic is logged and the stock Tesseract/layer
-result is kept: the plugin fails open.
+### Time budget
 
-## Compatibility guard
-
-`SUPPORTED_PAPERLESS` in `paperless_vlm_ocr/__init__.py` lists the Paperless
-`(major, minor)` versions the plugin runs on, and `VERIFIED_PAPERLESS` right
-above it names the image CI verifies the plugin against. On any other minor
-`score()` returns `None`, so ingestion falls back to stock Tesseract instead of
-breaking.
-
-The parser scores `15`, above the built-in Tesseract parser (`10`), and is only
-selected when `PAPERLESS_VLM_OCR_ENABLED=true` and endpoint, API key and model
-are all set.
+Each parse has a time budget counted from the start of `parse()`, which
+includes OCRmyPDF and the reference reads. `DOC_BUDGET_S` sets it, capped at the
+Celery task limit minus a safety margin (constant in `vlm.py`). If the budget
+is used up before the reference reads, they are skipped and pages with a layer
+are kept with reason `budget`. Before every model call, including each tile and
+the retry, the remaining time is checked. Per-call timeouts and transport
+retries are capped so they cannot exceed it, and the retry is skipped when the
+remaining time cannot cover a full timeout.
 
 ## Installation
 
-The published image is a data-only OCI image (built `FROM scratch`): it contains
-exactly the plugin tree at the image root (`paperless_vlm_ocr/` plus
-`paperless_vlm_ocr-<version>.dist-info/`). Mount it read-only on a directory that
-is on `PYTHONPATH`; `importlib.metadata` discovers the `dist-info` directory
-there and Paperless finds the `paperless_ngx.parsers` entry point.
-
-Requires Kubernetes 1.33+ for the image variant (app-template 5.3.0 gates the
-`image` persistence type on it, and image volumes are read-only by design), and
-a Paperless image that already ships `openai`, Pillow, `pdftotext`, `pdftoppm`
-and `tesseract` (the official image does).
+The release is a data-only OCI image (built `FROM scratch`) containing exactly
+`paperless_vlm_ocr/` and `paperless_vlm_ocr-<version>.dist-info/`. It is never
+run. Mount it read-only on a directory listed in `PYTHONPATH`, and Paperless
+finds the parser entry point through `importlib.metadata`. The Kubernetes
+image-volume variant needs image-volume support (app-template 5.3 requires
+Kubernetes 1.33+ for `persistence.type: image`). The Paperless image must ship
+`openai`, Pillow, poppler (`pdfinfo`, `pdftotext`, `pdftoppm`) and `tesseract`;
+the official image does.
 
 ### Kubernetes (app-template)
 
@@ -161,170 +130,195 @@ persistence:
 
 ### Plain Docker
 
-The image is not runnable; bind-mount the `site/` tree instead:
+For plain Docker, bind-mount the `site/` tree:
 
 ```sh
 docker run --rm \
   -v "$PWD/site:/usr/src/paperless/vlm-ocr:ro" \
   -e PYTHONPATH=/usr/src/paperless/vlm-ocr \
   -e PAPERLESS_VLM_OCR_ENABLED=true \
-  -e PAPERLESS_VLM_OCR_ENDPOINT=https://example.invalid/v1 \
+  -e PAPERLESS_VLM_OCR_ENDPOINT=https://llm.example/v1 \
   -e PAPERLESS_VLM_OCR_API_KEY=... \
   -e PAPERLESS_VLM_OCR_MODEL=... \
   ghcr.io/paperless-ngx/paperless-ngx:3.5.1
 ```
 
-Check discovery with:
+Check that Paperless sees the plugin:
 
 ```sh
 docker run --rm --read-only --tmpfs /tmp \
   -v "$PWD/site:/usr/src/paperless/vlm-ocr:ro" \
   -e PYTHONPATH=/usr/src/paperless/vlm-ocr \
   --entrypoint python3 ghcr.io/paperless-ngx/paperless-ngx:3.5.1 \
-  -c "from importlib.metadata import entry_points; print([e.value for e in entry_points(group='paperless_ngx.parsers')])"
+  -c "from importlib.metadata import entry_points, version; print([e.value for e in entry_points(group='paperless_ngx.parsers')], version('paperless-vlm-ocr'))"
 ```
 
 ## Configuration
 
-All settings come from the environment and are read on every parse.
+All settings are environment variables with the `PAPERLESS_VLM_OCR_` prefix.
+They are read when the parser is selected and again when it is constructed, so
+restart the workers after a change. The parser is only chosen when `ENABLED` is
+true, `ENDPOINT`, `API_KEY` and `MODEL` are all set, the Paperless minor is
+supported, and the file type is one the Tesseract parser handles.
+
+Defaults come from `site/paperless_vlm_ocr/config.py`, in its dataclass and its
+`from_env` method. Numeric rows show `from config.py` instead of a value, so a
+calibration change cannot make this table stale.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `PAPERLESS_VLM_OCR_ENABLED` | `false` | `true`/`1` enables the plugin |
-| `PAPERLESS_VLM_OCR_ENDPOINT` | *(empty)* | OpenAI-compatible base URL, ending in `/v1` |
-| `PAPERLESS_VLM_OCR_API_KEY` | *(empty)* | API key for that endpoint |
-| `PAPERLESS_VLM_OCR_MODEL` | *(empty)* | Vision model name |
-| `PAPERLESS_VLM_OCR_GATE_MODE` | `shadow` | `shadow` or `enforce` (anything else is `shadow`) |
-| `PAPERLESS_VLM_OCR_GATE_THRESHOLD` | `0.9` | Agreement threshold for `coverage`/`support` |
-| `PAPERLESS_VLM_OCR_GATE_MIN_TOKENS` | `15` | Minimum tokens for a layer/reference to be judged |
-| `PAPERLESS_VLM_OCR_TIMEOUT_S` | `120` | Request timeout in seconds |
-| `PAPERLESS_VLM_OCR_DOC_BUDGET_S` | `900` | Wall-clock budget for one parse, counted from the start of `parse()` (seconds) |
-| `PAPERLESS_VLM_OCR_CONCURRENCY` | `4` | Parallel model requests per document |
-| `PAPERLESS_VLM_OCR_MAX_PAGES` | `50` | Documents with more pages are left untouched |
-| `PAPERLESS_VLM_OCR_IMAGE_PX` | `1800` | Long side of each page/tile image sent to the model |
+| `PAPERLESS_VLM_OCR_ENABLED` | `false` | `true` or `1` enables the plugin |
+| `PAPERLESS_VLM_OCR_ENDPOINT` | *(unset)* | OpenAI-compatible base URL, usually ending in `/v1` |
+| `PAPERLESS_VLM_OCR_API_KEY` | *(unset)* | API key for that endpoint |
+| `PAPERLESS_VLM_OCR_MODEL` | *(unset)* | vision model name |
+| `PAPERLESS_VLM_OCR_GATE_MODE` | `shadow` | `shadow` logs candidates; `enforce` replaces them (any other value means `shadow`) |
+| `PAPERLESS_VLM_OCR_GATE_THRESHOLD` | from `config.py` | agreement threshold `t` in the gate rule |
+| `PAPERLESS_VLM_OCR_GATE_MIN_TOKENS` | from `config.py` | minimum tokens for a layer or reference read to be judged |
+| `PAPERLESS_VLM_OCR_TIMEOUT_S` | from `config.py` | per-request timeout in seconds |
+| `PAPERLESS_VLM_OCR_DOC_BUDGET_S` | from `config.py` | time budget per document, from the start of `parse()` |
+| `PAPERLESS_VLM_OCR_CONCURRENCY` | from `config.py` | parallel model requests per document |
+| `PAPERLESS_VLM_OCR_MAX_PAGES` | from `config.py` | documents with more pages are skipped untouched (warning) |
+| `PAPERLESS_VLM_OCR_IMAGE_PX` | from `config.py` | long side of each page/tile image sent to the model |
 | `PAPERLESS_VLM_OCR_DECISION_LOG` | `<DATA_DIR>/vlm-ocr/decisions.jsonl` | JSONL decision log path |
 
-## Logging
+`TIMEOUT_S` and `DOC_BUDGET_S` accept fractional seconds.
 
-The plugin logs on `paperless.parsing.vlm_ocr`, so its lines land in
-`paperless.log` (with the rest of `paperless.*`) and on the worker's stdout. The
-Tesseract parser keeps its own `paperless.parsing.tesseract` logger, so stock
-messages such as `pdftotext exited 0` are unchanged.
+## Observability
 
-One start line per document, one line per page, one line per model call and one
-summary per document (`file` is the name only, `sha` its first 12 hex digits):
+### Logs
+
+All plugin messages use the `paperless.parsing.vlm_ocr` logger and are written
+to `paperless.log` and the worker's stdout. The parent parser keeps its own
+`paperless.parsing.tesseract` logger, so stock messages such as
+`pdftotext exited 0` are unchanged. `sha` is the first 12 hex digits of the file
+checksum. `file` appears only on start, summary and skip lines.
+
+Angle brackets in these examples mark values that depend on the document or the
+configuration:
 
 ```
-vlm_ocr start file=statement.pdf sha=a1b2c3d4e5f6 mime=application/pdf pages=5 archive=yes gate_mode=shadow threshold=0.90 model=vision-model
-vlm_ocr page 2/5 sha=a1b2c3d4e5f6 kind=gated decision=keep coverage=0.987 support=0.991 threshold=0.90 layer_tokens=120 ref_tokens=118 source=layer reason=- tiles=1 loop_at=-
-vlm_ocr page 1/5 sha=a1b2c3d4e5f6 kind=empty_layer decision=vlm coverage=- support=- threshold=0.90 layer_tokens=0 ref_tokens=- source=vlm reason=- vlm_vs_fallback_coverage=0.941 vlm_vs_fallback_support=0.933 tiles=1 loop_at=-
-vlm_ocr page 4/5 sha=a1b2c3d4e5f6 kind=gated decision=vlm coverage=0.312 support=0.298 threshold=0.90 layer_tokens=87 ref_tokens=95 source=tesseract reason=RuntimeError tiles=1 loop_at=-
-vlm_ocr page 3/5 sha=a1b2c3d4e5f6 kind=empty_layer decision=vlm coverage=- support=- threshold=0.90 layer_tokens=0 ref_tokens=- source=vlm reason=loop_cut vlm_vs_fallback_coverage=0.812 vlm_vs_fallback_support=0.774 tiles=3 loop_at=533
-vlm_ocr llm page=1 sha=a1b2c3d4e5f6 model=vision-model host=api.example.test attempts=2 finish_reason=stop tokens_in=1700 tokens_out=420 seconds=12.3 image=1800x2546 bytes=731003 chars=47 response_id=chatcmpl-abc request_id=req-123 tiles=1 reason=- loop_at=-
-vlm_ocr llm page=3 sha=a1b2c3d4e5f6 model=vision-model host=api.example.test failed error=APIStatusError status=429 request_id=req-999 seconds=3.5 tiles=1
-vlm_ocr llm page=2 sha=a1b2c3d4e5f6 model=vision-model host=api.example.test attempts=2 finish_reason=stop tokens_in=1700 tokens_out=420 seconds=12.3 image=1800x2546 bytes=731003 chars=167 response_id=chatcmpl-abc request_id=req-123 rejected reason=repetition fallback_chars=812 tiles=1 loop_at=-
-vlm_ocr llm page=3 sha=a1b2c3d4e5f6 model=vision-model host=api.example.test attempts=3 finish_reason=length tokens_in=2600 tokens_out=640 seconds=18.7 image=1042x1802 bytes=642110 chars=1240 response_id=chatcmpl-def request_id=req-456 tiles=3 reason=loop_cut loop_at=533
-vlm_ocr summary file=statement.pdf sha=a1b2c3d4e5f6 pages=5 keep=3 vlm=1 fallback=1 would_vlm=0 no_signal=0 gate_mode=shadow threshold=0.90 coverage_min=0.312 coverage_mean=0.649 support_min=0.298 support_mean=0.644 sources=LLVTL content=assembled tokens_in=4300 tokens_out=1060 seconds=18.0 budget_exhausted=no
+# one start line per document
+vlm_ocr start file=statement.pdf sha=a1b2c3d4e5f6 mime=application/pdf pages=5 archive=yes gate_mode=shadow threshold=<t> model=vision-model
+
+# one line per page, after all model calls
+vlm_ocr page 2/5 sha=a1b2c3d4e5f6 kind=gated decision=keep coverage=<c> support=<s> threshold=<t> layer_tokens=<n> ref_tokens=<n> source=layer reason=- tiles=<n> loop_at=-
+vlm_ocr page 1/5 sha=a1b2c3d4e5f6 kind=empty_layer decision=vlm coverage=- support=- threshold=<t> layer_tokens=<n> ref_tokens=- source=vlm reason=- vlm_vs_fallback_coverage=<c> vlm_vs_fallback_support=<s> tiles=<n> loop_at=-
+vlm_ocr page 4/5 sha=a1b2c3d4e5f6 kind=gated decision=vlm coverage=<c> support=<s> threshold=<t> layer_tokens=<n> ref_tokens=<n> source=tesseract reason=APIConnectionError tiles=<n> loop_at=-
+
+# one line per model call: accepted (INFO), rejected or failed (WARNING)
+vlm_ocr llm page=1 sha=a1b2c3d4e5f6 model=vision-model host=api.example.test attempts=<n> finish_reason=stop tokens_in=<in> tokens_out=<out> seconds=12.3 image=<w>x<h> bytes=<bytes> chars=47 response_id=chatcmpl-abc request_id=req-123 tiles=<n> reason=- loop_at=-
+vlm_ocr llm page=2 sha=a1b2c3d4e5f6 model=vision-model host=api.example.test attempts=<n> finish_reason=stop tokens_in=<in> tokens_out=<out> seconds=12.3 image=<w>x<h> bytes=<bytes> chars=167 response_id=chatcmpl-abc request_id=req-123 rejected reason=repetition fallback_chars=<n> tiles=<n> loop_at=-
+vlm_ocr llm page=3 sha=a1b2c3d4e5f6 model=vision-model host=api.example.test failed error=APIStatusError status=429 request_id=req-999 seconds=3.5 tiles=<n>
+
+# one summary per document
+vlm_ocr summary file=statement.pdf sha=a1b2c3d4e5f6 pages=5 keep=2 vlm=1 fallback=2 would_vlm=0 no_signal=0 gate_mode=shadow threshold=<t> coverage_min=<c> coverage_mean=<c> support_min=<s> support_mean=<s> sources=LVLTT content=assembled tokens_in=<in> tokens_out=<out> seconds=18.0 budget_exhausted=no
+
+# a document skipped before any work
+vlm_ocr skipped file=archive.pdf sha=a1b2c3d4e5f6 pages=<n> max_pages=<limit>
 ```
 
-- `coverage`/`support` are `-` when the page has no reference read; `reason` is
-  the final reason: `loop_cut` when a prefix was kept, otherwise a rejection or
-  fallback reason, or the exception class of a failed attempt.
-- `tiles` is the number of tiles the page was split into (1 for a normal page);
-  `loop_at` is the offset of the detected loop inside that call's text (`-` when
-  none).
-- `vlm_vs_fallback_*` compares the model text with the text it displaced, so a
-  suspicious `source=vlm` page is visible without opening the document.
-- The summary's `sources` has one letter per page (`L` layer, `V` model,
-  `T` Tesseract) and `content` says whether `document.text` was rewritten
-  (`assembled`) or left as the parent parser produced it (`parent`);
-  `budget_exhausted=yes` means at least one page stopped on the document
-  budget (its reason is `budget`).
-- Lines never contain the API key, the endpoint path or query, request bodies or
-  transcribed text: failures report the exception class, HTTP status and request
-  id, while calls - accepted or rejected - report attempts, sizes, token counts
-  and the response/request ids only.
+- `decision` is the gate verdict, `source` is where the page's text came from
+  (`layer`, `vlm`, `tesseract`), and `reason` is the final outcome: `loop_cut`,
+  `budget`, a rejection, a fallback failure or the exception class of a failed
+  call.
+- `coverage`/`support` are `-` without a reference read. `vlm_vs_fallback_*`
+  appear only after a model call and compare the output with the text it
+  replaced. `tiles` counts the page's tiles, and `loop_at` is the loop offset in
+  that call's text.
+- In the summary, `sources` is one letter per page (`L` layer, `V` model, `T`
+  Tesseract). `content` says whether `document.text` was rewritten
+  (`assembled`) or left as the parent produced it (`parent`).
+  `budget_exhausted=yes` means at least one page stopped on the budget.
 
-## Decision log
+Warnings also cover a plugin disabled by configuration or version (once per
+process), a failed reference read, a failed fallback read and an unwritable
+decision log.
 
-One JSON line per page, appended whether or not anything changed:
+### Decision log
 
-`ts`, `sha256` (of the parsed file), `mime`, `file`, `page`, `pages`, `kind`
-(`gated`/`empty_layer`), `decision` (`keep`/`vlm`/`would_vlm`/`no_signal`),
-`coverage`, `support`, `threshold`, `layer_tokens`, `ref_tokens`, `source`
-(`layer`/`vlm`/`tesseract`), `fallback_reason`, `vlm_seconds`, `input_tokens`,
-`output_tokens`, `model`, `finish_reason`, `attempts`, `response_id`,
-`request_id`, `payload_bytes`, `image_px`, `vlm_chars`, `fallback_chars`,
-`layer_chars`, `vlm_vs_fallback_coverage`, `vlm_vs_fallback_support`,
-`error_status`, `gate_mode`, `plugin_version`, `tiles`, `loop_at`, `reason`.
+One JSON object per page is appended to the decision log, whether or not
+anything changed. A failed write is a warning, never a parse failure. Use
+`sha256` to map a record back with `Document.objects.filter(checksum=...)`.
 
-`fallback_reason` carries a rejection reason (including `budget` when the
-document budget stopped the page), a fallback failure, or the exception class of
-a failed model call (with its HTTP status in `error_status`);
-`reason` is the final outcome (`loop_cut` for an accepted prefix, `budget` when
-the document budget stopped the page, otherwise the same value as
-`fallback_reason`). `tiles` and `loop_at` mirror the log line;
-`attempts` counts the first request plus retries (including a second call for a
-rejected page), and `response_id`/`request_id` identify the last call upstream.
-A failing log write is a warning, never a parse failure. Use the `sha256` to map
-a record back with `Document.objects.filter(checksum=...)`.
+| Group | Fields |
+|---|---|
+| Document | `ts`, `sha256`, `mime`, `file`, `page`, `pages`, `plugin_version`, `gate_mode` |
+| Gate | `kind`, `decision`, `coverage`, `support`, `threshold`, `layer_tokens`, `ref_tokens`, `source`, `reason`, `fallback_reason` |
+| Model call | `model`, `attempts`, `finish_reason`, `vlm_seconds`, `input_tokens`, `output_tokens`, `payload_bytes`, `image_px`, `response_id`, `request_id`, `error_status` |
+| Text | `vlm_chars`, `fallback_chars`, `layer_chars`, `vlm_vs_fallback_coverage`, `vlm_vs_fallback_support`, `tiles`, `loop_at` |
+
+`fallback_reason` is a rejection reason, `budget`, `ref_error` or the exception
+class of the failed call (with its HTTP status in `error_status`). `reason` is
+the final outcome. `attempts` counts the first call plus the retry and
+transport retries, and the ids identify the last call upstream.
+
+The API key, the endpoint path/query/userinfo (only the host is logged),
+request bodies and transcriptions never appear in the logs or the decision
+log. Failures carry only the exception class, HTTP status and request id.
 
 ## Offline gate scan
 
-`scan.py` evaluates the gate on PDFs without Django and without the vision
-model, always in enforce mode, so you can review which pages would be routed:
+`scan.py` runs the gate on PDFs without Django, a database or a vision model,
+always in enforce mode, so you can preview which pages would be routed:
 
 ```sh
 PYTHONPATH=site python3 -m paperless_vlm_ocr.scan \
-  --lang deu+eng --jobs 8 --threshold 0.9 --min-tokens 15 \
-  --out results.jsonl *.pdf
+  --lang deu+eng --jobs 8 --out results.jsonl *.pdf
 ```
 
-It writes one record per page (`file`, `page`, `layer_tokens`, `ref_tokens`,
-`coverage`, `support`, `decision`), where `decision` is
-`keep|vlm|no_signal|empty_layer`, plus `error` records for unreadable files. It
-needs `pdftotext`, `pdftoppm` and `tesseract` on `PATH`.
+It writes one JSONL record per page (`file`, `page`, `layer_tokens`,
+`ref_tokens`, `coverage`, `support`, `decision`), where `decision` is `keep`,
+`vlm`, `no_signal` or `empty_layer`. Unreadable files or pages produce
+`decision: "error"` with an `error` message. `--threshold` and `--min-tokens`
+have their own defaults; set them to the values your deployment uses. `--lang`
+defaults to `deu+eng`, `--jobs` to a single worker and `--out` to
+`results.jsonl`. Poppler (`pdfinfo`, `pdftotext`, `pdftoppm`) and Tesseract must
+be on `PATH`.
 
-## Releasing
+## Compatibility & upgrades
 
-The version lives in three places and they must move together:
+`SUPPORTED_PAPERLESS` in `site/paperless_vlm_ocr/__init__.py` lists the accepted
+`(major, minor)` versions. `VERIFIED_PAPERLESS` above it names the Paperless
+image CI verifies against. On any other minor `score()` returns `None`, warns
+once and disables the plugin, so a Paperless upgrade falls back to stock
+Tesseract. The plugin's score is higher than the built-in Tesseract parser's,
+so it wins whenever it is eligible.
 
-1. `__version__` in `site/paperless_vlm_ocr/__init__.py`,
-2. the dist-info directory name `site/paperless_vlm_ocr-<version>.dist-info/`,
-3. the `Version:` line in that directory's `METADATA`.
+Upgrade order: merge and deploy the plugin release that lists the new minor
+before upgrading Paperless. Listing a new minor keeps the old ones, so that
+release still runs on the version being replaced and there is no gap without
+the plugin.
 
-Bump all three in one pull request and merge it to `main`. CI verifies the
-plugin against the Paperless-ngx image named by `VERIFIED_PAPERLESS`, runs the
-unit tests and a real parse on a one-page scan inside that image, and then:
+## Development & releasing
 
-1. publishes `ghcr.io/anokfireball/paperless-vlm-ocr:<version>` for
-   `linux/amd64` and `linux/arm64`,
-2. creates the `v<version>` tag and a GitHub release with generated notes.
+Unit tests need Python 3.12, `pytest` and `openai`; the smoke test and CI need
+Docker. Run the tests with the plugin tree on `PYTHONPATH`:
 
-A push to `main` whose version is already tagged publishes nothing: no image is
-rebuilt and no release is recreated.
+```sh
+PYTHONPATH=site pytest -q tests
+```
 
-Renovate keeps `VERIFIED_PAPERLESS` current; the annotation above it in
-`site/paperless_vlm_ocr/__init__.py` is a `renovate.json` custom manager. Its
-post-upgrade task, `node .github/scripts/renovate-paperless-bump.mjs`, either
+CI (`.github/workflows/ci.yaml`) runs three jobs:
 
-- leaves everything alone for a patch update of an already supported minor
-  (the CI in-image checks, entry point and smoke parse, prove the new image on
-  the PR), or
-- adds the new `(major, minor)` to `SUPPORTED_PAPERLESS` and bumps the plugin's
-  patch version in all three places, so merging the PR publishes a new image.
+1. test: no tab characters under `site/`, the three version places agree, unit
+   tests.
+2. paperless: against `VERIFIED_PAPERLESS`, checks the entry point,
+   distribution version and supported version; runs unit tests inside the image
+   when `pytest` is available; and does a smoke parse whose unreachable
+   endpoint proves the Tesseract fallback, the archive and the decision log.
+3. image: on `main` only, and only when `v<version>` is not tagged yet. Builds
+   and pushes `ghcr.io/anokfireball/paperless-vlm-ocr:<version>` for
+   `linux/amd64` and `linux/arm64`, then creates the tag and a GitHub release
+   with generated notes. Re-merging a released version publishes nothing.
 
-`site/` must not contain tab characters; CI fails on them. `$` is fine.
+The version lives in three places that must move together: `__version__` in
+`site/paperless_vlm_ocr/__init__.py`, the
+`site/paperless_vlm_ocr-<version>.dist-info/` directory name, and the `Version:`
+line in its `METADATA`.
 
-### Compatibility and upgrade order
-
-On a Paperless minor that is not in `SUPPORTED_PAPERLESS`, `score()` returns
-`None`: the plugin steps aside with a warning and ingestion uses stock Tesseract
-parsing. A Paperless upgrade therefore cannot break parsing, even before a
-plugin release catches up.
-
-When upgrading Paperless to a new minor, merge and deploy the plugin release
-that lists it first. Listing a new minor keeps the older ones (they stay in
-`SUPPORTED_PAPERLESS`), so that release still runs on the Paperless version you
-are replacing, and deploying it before the Paperless upgrade leaves no window
-without the plugin.
+Renovate tracks `VERIFIED_PAPERLESS` through the `# renovate:` regex-manager
+annotation above it. For a patch of an already supported minor the
+post-upgrade script changes nothing, and the in-image CI proves the new image.
+For a new minor it adds the minor to `SUPPORTED_PAPERLESS` and bumps the
+plugin's patch version in all three places, so merging that pull request
+publishes a new image.

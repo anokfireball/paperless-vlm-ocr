@@ -28,7 +28,7 @@ def plain(length: int) -> str:
     return text
 
 
-FALLBACK = plain(300)
+FALLBACK = plain(500)
 
 
 # ----------------------------------------------------------------------
@@ -48,12 +48,12 @@ def test_find_loop_unit_1_1_1() -> None:
 
 def test_find_loop_unit_5p0b2b() -> None:
     head = "Prozess-Typ: "
-    assert find_loop(head + "5p0b2b" * 50) == len(head)
+    assert find_loop(head + "5p0b2b" * 70) == len(head)
 
 
 def test_find_loop_unit_qds() -> None:
     head = "Projekt: C:"
-    assert find_loop(head + "\\qds\\" * 60) == len(head)
+    assert find_loop(head + "\\qds\\" * 90) == len(head)
 
 
 def test_find_loop_repeated_base64_lines() -> None:
@@ -70,14 +70,30 @@ def test_find_loop_repeated_table_rows() -> None:
     assert find_loop(head + "\n" + row * 12) == len(head)
 
 
-def test_find_loop_needs_two_hundred_characters() -> None:
-    assert find_loop("x" * 199) is None
-    assert find_loop("x" * 200) == 0
+def test_find_loop_needs_four_hundred_characters() -> None:
+    assert find_loop("x" * 399) is None
+    assert find_loop("x" * 400) == 0
 
 
 def test_find_loop_ignores_a_few_repeats() -> None:
-    # 7 identical 40-character lines are a table, not a loop
-    assert find_loop(("A" * 39 + "\n") * 7) is None
+    # 7 identical 60-character lines are a table, not a loop
+    assert find_loop(("A" * 59 + "\n") * 7) is None
+
+
+def test_find_loop_catches_a_924_char_base64_loop() -> None:
+    head = "TSE Prüfwert:\n"
+    unit = ("M2YwNjM2" * 14) + "M2Y"  # 115 characters
+    assert len(unit) == 115
+    loop = (unit * 9)[:924]
+    assert len(loop) == 924
+    assert find_loop(head + loop) == len(head)
+
+
+def test_find_loop_ignores_long_space_runs() -> None:
+    # layout-preserving text layers emit runs of spaces; 222 is not a loop
+    text = plain(400) + " " * 222 + plain(400)
+    assert len(text) > 400
+    assert find_loop(text) is None
 
 
 def test_find_loop_ignores_normal_text() -> None:
@@ -100,7 +116,7 @@ def test_find_loop_ignores_normal_text() -> None:
         "Zahlbar innerhalb von 14 Tagen ohne Abzug.\n"
         "Vielen Dank für Ihren Einkauf.\n"
     )
-    assert len(text) > 200
+    assert len(text) > 400
     assert find_loop(text) is None
 
 
@@ -130,7 +146,7 @@ def test_find_loop_ignores_a_long_statement() -> None:
 
 
 def test_evaluate_accepts_a_prefix_at_the_ratio() -> None:
-    prefix = plain(180)
+    prefix = plain(300)
     text = prefix + "\n" + "1:" * 200
     kept, reason, loop_at = evaluate(result(text), FALLBACK)
     assert kept == prefix
@@ -139,7 +155,7 @@ def test_evaluate_accepts_a_prefix_at_the_ratio() -> None:
 
 
 def test_evaluate_rejects_a_prefix_below_the_ratio() -> None:
-    prefix = plain(179)
+    prefix = plain(299)
     text = prefix + "\n" + "1:" * 200
     kept, reason, loop_at = evaluate(result(text), FALLBACK)
     assert kept is None
@@ -153,7 +169,7 @@ def test_evaluate_rejects_a_loop_without_a_usable_prefix() -> None:
 
 
 def test_evaluate_cuts_a_line_aligned_loop_after_the_previous_line() -> None:
-    head = plain(200)
+    head = plain(300)
     row = "| 01.11.2026 | Miete November | -1.250,00 EUR |"
     text = head + "\n" + (row + "\n") * 12
     kept, reason, loop_at = evaluate(result(text), FALLBACK)
@@ -168,7 +184,7 @@ def test_evaluate_ignores_the_ratio_when_the_fallback_is_short() -> None:
 
 
 def test_evaluate_loop_wins_over_a_length_finish() -> None:
-    prefix = plain(180)
+    prefix = plain(300)
     text = prefix + "\n" + "1:" * 200
     kept, reason, _ = evaluate(result(text, finish_reason="length"), FALLBACK)
     assert kept == prefix
@@ -272,12 +288,12 @@ def test_reject_reason_keeps_its_semantics() -> None:
         "truncated"
     )
     assert reject_reason(result("   \n  "), FALLBACK) == "empty"
-    assert reject_reason(result("Betrag\n" * 40), FALLBACK) == "repetition"
+    assert reject_reason(result("Betrag\n" * 80), FALLBACK) == "repetition"
     assert reject_reason(result(plain(300)), FALLBACK) is None
 
 
 def test_reject_reason_accepts_a_cut_prefix() -> None:
-    text = plain(180) + "\n" + "1:" * 200
+    text = plain(300) + "\n" + "1:" * 200
     assert reject_reason(result(text), FALLBACK) is None
 
 
