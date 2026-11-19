@@ -31,7 +31,7 @@ def _png(width: int, height: int) -> bytes:
 
 
 def _result(**kwargs) -> VlmResult:
-    kwargs.setdefault("text", "Kontoinhaber Fabian Karl Koller\nIBAN DE89 3704 0044")
+    kwargs.setdefault("text", "Kontoinhaber Beispiel GmbH\nBetrag -1.250,00 EUR")
     kwargs.setdefault("finish_reason", "stop")
     kwargs.setdefault("input_tokens", 1700)
     kwargs.setdefault("output_tokens", 420)
@@ -103,7 +103,7 @@ def test_page_line_keep() -> None:
     assert line == (
         f"vlm_ocr page 2/5 sha={SHA12} kind=gated decision=keep "
         "coverage=0.987 support=0.991 threshold=0.90 layer_tokens=120 "
-        "ref_tokens=118 source=layer reason=-"
+        "ref_tokens=118 source=layer reason=- tiles=1 loop_at=-"
     )
 
 
@@ -129,7 +129,7 @@ def test_page_line_vlm_with_fallback_agreement() -> None:
         f"vlm_ocr page 1/3 sha={SHA12} kind=empty_layer decision=vlm "
         "coverage=- support=- threshold=0.90 layer_tokens=0 ref_tokens=- "
         "source=vlm reason=- vlm_vs_fallback_coverage=0.941 "
-        "vlm_vs_fallback_support=0.933"
+        "vlm_vs_fallback_support=0.933 tiles=1 loop_at=-"
     )
 
 
@@ -151,7 +151,35 @@ def test_page_line_tesseract_fallback_with_reason() -> None:
     assert line == (
         f"vlm_ocr page 4/5 sha={SHA12} kind=gated decision=vlm "
         "coverage=0.312 support=0.298 threshold=0.90 layer_tokens=87 "
-        "ref_tokens=95 source=tesseract reason=RuntimeError"
+        "ref_tokens=95 source=tesseract reason=RuntimeError tiles=1 loop_at=-"
+    )
+
+
+def test_page_line_loop_cut() -> None:
+    line = format_page_line(
+        page=3,
+        pages=3,
+        sha256=SHA,
+        kind="empty_layer",
+        decision="vlm",
+        coverage=None,
+        support=None,
+        threshold=0.9,
+        layer_tokens=0,
+        ref_tokens=None,
+        source="vlm",
+        reason="loop_cut",
+        vlm_called=True,
+        vlm_vs_fallback_coverage=0.812,
+        vlm_vs_fallback_support=0.774,
+        tiles=3,
+        loop_at=533,
+    )
+    assert line == (
+        f"vlm_ocr page 3/3 sha={SHA12} kind=empty_layer decision=vlm "
+        "coverage=- support=- threshold=0.90 layer_tokens=0 ref_tokens=- "
+        "source=vlm reason=loop_cut vlm_vs_fallback_coverage=0.812 "
+        "vlm_vs_fallback_support=0.774 tiles=3 loop_at=533"
     )
 
 
@@ -182,8 +210,34 @@ def test_summary_line() -> None:
         "fallback=1 would_vlm=0 no_signal=0 gate_mode=shadow threshold=0.90 "
         "coverage_min=0.312 coverage_mean=0.649 support_min=0.298 "
         "support_mean=0.644 sources=LVT content=assembled tokens_in=1700 "
-        "tokens_out=420 seconds=18.0"
+        "tokens_out=420 seconds=18.0 budget_exhausted=no"
     )
+
+
+def test_summary_line_reports_budget_exhaustion() -> None:
+    line = format_summary_line(
+        file="statement.pdf",
+        sha256=SHA,
+        pages=3,
+        keep=1,
+        vlm=0,
+        fallback=2,
+        would_vlm=0,
+        no_signal=0,
+        gate_mode="shadow",
+        threshold=0.9,
+        coverage_min=0.312,
+        coverage_mean=0.6495,
+        support_min=0.298,
+        support_mean=0.6445,
+        sources="LTT",
+        content="assembled",
+        tokens_in=1700,
+        tokens_out=420,
+        seconds=18.0,
+        budget_exhausted=True,
+    )
+    assert line.endswith("seconds=18.0 budget_exhausted=yes")
 
 
 def test_llm_success_line() -> None:
@@ -197,10 +251,25 @@ def test_llm_success_line() -> None:
     assert line == (
         f"vlm_ocr llm page=1 sha={SHA12} model={MODEL} host={HOST} "
         "attempts=2 finish_reason=stop tokens_in=1700 tokens_out=420 "
-        "seconds=12.3 image=1800x2546 bytes=731003 chars=51 "
-        "response_id=chatcmpl-abc request_id=req-123"
+        "seconds=12.3 image=1800x2546 bytes=731003 chars=47 "
+        "response_id=chatcmpl-abc request_id=req-123 "
+        "tiles=1 reason=- loop_at=-"
     )
     assert "Kontoinhaber" not in line
+
+
+def test_llm_success_line_with_loop_cut() -> None:
+    line = format_llm_line(
+        page=1,
+        sha256=SHA,
+        model=MODEL,
+        host=HOST,
+        result=_result(),
+        tiles=3,
+        reason="loop_cut",
+        loop_at=533,
+    )
+    assert line.endswith("tiles=3 reason=loop_cut loop_at=533")
 
 
 def test_llm_failure_line() -> None:
@@ -216,7 +285,7 @@ def test_llm_failure_line() -> None:
     )
     assert line == (
         f"vlm_ocr llm page=3 sha={SHA12} model={MODEL} host={HOST} failed "
-        "error=APIStatusError status=429 request_id=req-999 seconds=3.5"
+        "error=APIStatusError status=429 request_id=req-999 seconds=3.5 tiles=1"
     )
 
 
@@ -233,7 +302,7 @@ def test_llm_failure_line_without_status_or_request_id() -> None:
     )
     assert line == (
         f"vlm_ocr llm page=3 sha={SHA12} model={MODEL} host={HOST} failed "
-        "error=APIConnectionError status=- request_id=- seconds=-"
+        "error=APIConnectionError status=- request_id=- seconds=- tiles=1"
     )
 
 
@@ -252,7 +321,7 @@ def test_llm_rejection_line() -> None:
         "attempts=2 finish_reason=stop tokens_in=1700 tokens_out=420 "
         "seconds=12.3 image=1800x2546 bytes=731003 chars=167 "
         "response_id=chatcmpl-abc request_id=req-123 "
-        "rejected reason=repetition fallback_chars=812"
+        "rejected reason=repetition fallback_chars=812 tiles=1 loop_at=-"
     )
 
 

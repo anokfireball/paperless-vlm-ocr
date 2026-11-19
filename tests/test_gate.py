@@ -17,7 +17,7 @@ def _cfg(**kwargs) -> VlmOcrConfig:
 
 
 def test_tokenize_joins_letter_spaced_runs() -> None:
-    assert tokenize("K a r l  K o l l e r") == ["karl", "koller"]
+    assert tokenize("B e i s p i e l  G m b H") == ["beispiel", "gmbh"]
 
 
 def test_tokenize_keeps_split_words_split() -> None:
@@ -25,13 +25,13 @@ def test_tokenize_keeps_split_words_split() -> None:
 
 
 def test_agreement_identical() -> None:
-    text = tokenize("Kontoinhaber Fabian Karl Koller")
+    text = tokenize("Kontoinhaber Beispiel GmbH")
     assert agreement(text, text) == (1.0, 1.0)
 
 
 def test_agreement_broken_layer() -> None:
-    layer = tokenize("Kontoinhaber Fabian Karl Koller")
-    ref = tokenize("Ko nto inha ber Fa bia n Ka rl Ko ller")
+    layer = tokenize("Kontoinhaber Beispiel GmbH")
+    ref = tokenize("Ko nto inha ber Bei spiel Gm bh")
     coverage, support = agreement(layer, ref)
     assert coverage < 0.3
     assert support < 0.3

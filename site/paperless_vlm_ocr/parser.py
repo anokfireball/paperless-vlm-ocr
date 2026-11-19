@@ -20,6 +20,7 @@ from paperless.version import __version__ as paperless_version
 
 from paperless_vlm_ocr import SUPPORTED_PAPERLESS
 from paperless_vlm_ocr import __version__
+from paperless_vlm_ocr.assemble import needs_reassembly
 from paperless_vlm_ocr.config import VlmOcrConfig
 from paperless_vlm_ocr.decisions import append as append_decision
 from paperless_vlm_ocr.gate import agreement
@@ -32,24 +33,34 @@ from paperless_vlm_ocr.logfmt import format_start_line
 from paperless_vlm_ocr.logfmt import format_summary_line
 from paperless_vlm_ocr.logfmt import sha_prefix
 from paperless_vlm_ocr.pages import image_to_png
+from paperless_vlm_ocr.pages import join_tiles
 from paperless_vlm_ocr.pages import layer_text
 from paperless_vlm_ocr.pages import page_count
+from paperless_vlm_ocr.pages import render_page_tiles
 from paperless_vlm_ocr.pages import render_png
 from paperless_vlm_ocr.pages import tesseract_text
 from paperless_vlm_ocr.vlm import VlmClient
 from paperless_vlm_ocr.vlm import VlmResult
+from paperless_vlm_ocr.vlm import call_timeout
 from paperless_vlm_ocr.vlm import clean
+from paperless_vlm_ocr.vlm import combine_results
+from paperless_vlm_ocr.vlm import deadline_from
+from paperless_vlm_ocr.vlm import evaluate
 from paperless_vlm_ocr.vlm import format_llm_failure_line
 from paperless_vlm_ocr.vlm import format_llm_line
 from paperless_vlm_ocr.vlm import format_llm_rejection_line
-from paperless_vlm_ocr.vlm import reject_reason
+from paperless_vlm_ocr.vlm import may_retry
+from paperless_vlm_ocr.vlm import transport_retries
 
 LOGGER_NAME = "paperless.parsing.vlm_ocr"
 logger = logging.getLogger(LOGGER_NAME)
 
 Source = Literal["layer", "vlm", "tesseract"]
 
-_REJECT_REASONS = frozenset({"truncated", "empty", "repetition", "runaway"})
+_REJECT_REASONS = frozenset(
+    {"truncated", "empty", "repetition", "runaway", "budget"}
+)
+_RETRY_REASONS = frozenset({"truncated", "repetition", "empty"})
 
 _warned: set[str] = set()
 
@@ -72,6 +83,7 @@ class _Page:
     ref_tokens: int | None = None
     ref_attempted: bool = False
     ref_error: bool = False
+    ref_skipped: bool = False
     kind: str = "gated"
     decision: str = "keep"
     coverage: float | None = None
@@ -94,6 +106,9 @@ class _Page:
     vlm_vs_fallback_coverage: float | None = None
     vlm_vs_fallback_support: float | None = None
     error_status: int | None = None
+    tiles: int = 1
+    loop_at: int | None = None
+    reason: str | None = None
 
 
 @dataclass
@@ -102,6 +117,10 @@ class _Call:
 
     fallback: str = ""
     result: VlmResult | None = None
+    text: str | None = None
+    reason: str | None = None
+    loop_at: int | None = None
+    tiles: int = 1
     error: str | None = None
     called: bool = False
     status: int | None = None
@@ -179,10 +198,11 @@ class VlmOcrParser(RasterisedDocumentParser):
         produce_archive: bool = True,
     ) -> None:
         document_path = Path(document_path)
+        t0 = time.monotonic()
         super().parse(document_path, mime_type, produce_archive=produce_archive)
         parent_text = self.text
         try:
-            self._process(document_path, mime_type)
+            self._process(document_path, mime_type, t0)
         except Exception:
             self.text = parent_text
             logger.exception(
@@ -193,9 +213,11 @@ class VlmOcrParser(RasterisedDocumentParser):
     # Pipeline
     # ------------------------------------------------------------------
 
-    def _process(self, document_path: Path, mime_type: str) -> None:
+    def _process(self, document_path: Path, mime_type: str, t0: float) -> None:
         cfg = self.cfg
         started = time.monotonic()
+        time_limit = getattr(settings, "CELERY_TASK_TIME_LIMIT", None) or 1800
+        deadline = deadline_from(t0, cfg.doc_budget_s, float(time_limit))
         name = document_path.name
         sha256 = hashlib.sha256(document_path.read_bytes()).hexdigest()
 
@@ -229,9 +251,9 @@ class VlmOcrParser(RasterisedDocumentParser):
         pages = [_Page(number=number) for number in range(1, pages_total + 1)]
 
         self._read_layers(pages, orig_pdf)
-        self._reference_ocr(pages, orig_pdf)
+        self._reference_ocr(pages, orig_pdf, deadline)
         self._classify(pages)
-        self._transcribe(pages, document_path, render_pdf, sha256)
+        self._transcribe(pages, document_path, render_pdf, sha256, deadline)
         self._log_pages(pages, pages_total, sha256)
         assembled = self._apply_text(pages)
         self._write_decisions(pages, pages_total, mime_type, sha256, name)
@@ -267,6 +289,7 @@ class VlmOcrParser(RasterisedDocumentParser):
         self,
         pages: list[_Page],
         orig_pdf: Path | None,
+        deadline: float,
     ) -> None:
         if orig_pdf is None:
             return
@@ -274,6 +297,10 @@ class VlmOcrParser(RasterisedDocumentParser):
             page for page in pages if page.layer_tokens >= self.cfg.min_tokens
         ]
         if not targets:
+            return
+        if deadline - time.monotonic() <= 0:
+            for page in targets:
+                page.ref_skipped = True
             return
         workers = max(1, int(getattr(settings, "THREADS_PER_WORKER", 1)))
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -306,6 +333,12 @@ class VlmOcrParser(RasterisedDocumentParser):
 
     def _classify(self, pages: list[_Page]) -> None:
         for page in pages:
+            if page.ref_skipped:
+                page.kind = "gated"
+                page.decision = "keep"
+                page.fallback_reason = "budget"
+                page.reason = "budget"
+                continue
             if page.ref_error:
                 page.kind = "gated"
                 page.decision = "keep"
@@ -337,6 +370,7 @@ class VlmOcrParser(RasterisedDocumentParser):
         document_path: Path,
         render_pdf: Path | None,
         sha256: str,
+        deadline: float,
     ) -> None:
         targets = [page for page in pages if self._needs_vlm(page)]
         if not targets:
@@ -366,6 +400,7 @@ class VlmOcrParser(RasterisedDocumentParser):
                     document_path,
                     render_pdf,
                     page,
+                    deadline,
                 ): page
                 for page in targets
             }
@@ -384,47 +419,141 @@ class VlmOcrParser(RasterisedDocumentParser):
         document_path: Path,
         render_pdf: Path | None,
         page: _Page,
+        deadline: float,
     ) -> _Call:
         fallback = self._fallback_text(page, document_path, render_pdf)
         started = time.monotonic()
+        if deadline - started <= 0:
+            return _Call(fallback=fallback, reason="budget")
         try:
-            png = self._render_vlm_page(document_path, render_pdf, page.number)
+            tiles = self._render_vlm_tiles(
+                document_path,
+                render_pdf,
+                page.number,
+            )
         except Exception as exc:
             return _Call(fallback=fallback, error=type(exc).__name__)
-        try:
-            result = client.transcribe(png.read_bytes())
-        except Exception as exc:
-            return _Call(
-                fallback=fallback,
-                error=type(exc).__name__,
-                called=True,
-                status=getattr(exc, "status_code", None),
-                request_id=getattr(exc, "request_id", None),
-                seconds=time.monotonic() - started,
-            )
+        results: list[VlmResult] = []
+        texts: list[str] = []
+        reason: str | None = None
+        loop_at: int | None = None
+        for png in tiles:
+            try:
+                result, text, tile_reason, tile_loop = self._transcribe_tile(
+                    client,
+                    png,
+                    fallback,
+                    share=1.0 / len(tiles),
+                    deadline=deadline,
+                )
+            except Exception as exc:
+                return _Call(
+                    fallback=fallback,
+                    error=type(exc).__name__,
+                    called=True,
+                    status=getattr(exc, "status_code", None),
+                    request_id=getattr(exc, "request_id", None),
+                    seconds=time.monotonic() - started,
+                    tiles=len(tiles),
+                )
+            if result is None:
+                return _Call(
+                    fallback=fallback,
+                    result=combine_results(results) if results else None,
+                    reason=tile_reason,
+                    loop_at=loop_at,
+                    tiles=len(tiles),
+                    called=bool(results),
+                    seconds=time.monotonic() - started,
+                )
+            results.append(result)
+            if tile_loop is not None and loop_at is None:
+                loop_at = tile_loop
+            if text is None:
+                reason = tile_reason
+                break
+            if tile_reason is not None and reason is None:
+                reason = tile_reason
+            texts.append(text)
+        combined = combine_results(results)
+        accepted = reason not in _REJECT_REASONS
+        if accepted:
+            combined.text = join_tiles(texts)
         return _Call(
             fallback=fallback,
-            result=result,
+            result=combined,
+            text=combined.text if accepted else None,
+            reason=reason,
+            loop_at=loop_at,
+            tiles=len(tiles),
             called=True,
             seconds=time.monotonic() - started,
         )
 
-    def _render_vlm_page(
+    def _transcribe_tile(
+        self,
+        client: VlmClient,
+        png: Path,
+        fallback: str,
+        *,
+        share: float,
+        deadline: float,
+    ) -> tuple[VlmResult | None, str | None, str | None, int | None]:
+        """One tile: one call, plus one retry on a retryable rejection.
+
+        A call is only started when the document budget can still cover it;
+        otherwise the tile reports ``budget`` and the page falls back. Per-call
+        timeouts and transport retries are capped by the same budget.
+        Transport retries stay inside the client; the retry here is only for a
+        paid-for answer that the evaluator rejected. Returns the merged call
+        record, the accepted text (or None), the reason and the loop offset.
+        """
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None, None, "budget", None
+        timeout_s = self.cfg.timeout_s
+        data = png.read_bytes()
+        result = client.transcribe(
+            data,
+            timeout=call_timeout(remaining, timeout_s),
+            max_retries=transport_retries(remaining, timeout_s),
+        )
+        text, reason, loop_at = evaluate(result, fallback, share=share)
+        results = [result]
+        if text is None and reason in _RETRY_REASONS:
+            remaining = deadline - time.monotonic()
+            if may_retry(remaining, timeout_s):
+                result = client.transcribe(
+                    data,
+                    timeout=call_timeout(remaining, timeout_s),
+                    max_retries=transport_retries(remaining, timeout_s),
+                )
+                text, reason, loop_at = evaluate(result, fallback, share=share)
+                results.append(result)
+        return combine_results(results), text, reason, loop_at
+
+    def _render_vlm_tiles(
         self,
         document_path: Path,
         render_pdf: Path | None,
         number: int,
-    ) -> Path:
-        out = self.tempdir / f"vlmocr-vlm-{number}.png"
+    ) -> list[Path]:
         if render_pdf is not None:
-            return render_png(
+            source = render_png(
                 render_pdf,
                 number,
-                out,
-                scale_to=self.cfg.image_px,
+                self.tempdir / f"vlmocr-page-{number}.png",
+                scale_to=None,
                 gray=False,
             )
-        return image_to_png(document_path, out, self.cfg.image_px)
+        else:
+            source = document_path
+        return render_page_tiles(
+            source,
+            self.tempdir,
+            number,
+            image_px=self.cfg.image_px,
+        )
 
     def _fallback_text(
         self,
@@ -474,6 +603,9 @@ class VlmOcrParser(RasterisedDocumentParser):
     def _apply_vlm(self, page: _Page, call: _Call) -> None:
         result = call.result
         page.fallback_chars = len(call.fallback)
+        page.tiles = call.tiles
+        page.loop_at = call.loop_at
+        page.reason = call.reason
         text = ""
         if result is not None:
             page.vlm_called = True
@@ -486,27 +618,26 @@ class VlmOcrParser(RasterisedDocumentParser):
             page.request_id = result.request_id
             page.payload_bytes = result.payload_bytes
             page.image_px = result.image_px
-            text = clean(result.text)
-            page.vlm_chars = len(text)
-            fallback_tokens = tokenize(call.fallback)
-            if fallback_tokens:
-                (
-                    page.vlm_vs_fallback_coverage,
-                    page.vlm_vs_fallback_support,
-                ) = agreement(tokenize(text), fallback_tokens)
+            if call.text is not None:
+                text = call.text
+                page.vlm_chars = len(text)
+                fallback_tokens = tokenize(call.fallback)
+                if fallback_tokens:
+                    (
+                        page.vlm_vs_fallback_coverage,
+                        page.vlm_vs_fallback_support,
+                    ) = agreement(tokenize(text), fallback_tokens)
+            else:
+                page.vlm_chars = len(clean(result.text))
 
-        reason = (
-            call.error
-            if result is None
-            else reject_reason(result, call.fallback)
-        )
         if result is None:
             page.error_status = call.status
             page.request_id = call.request_id
             page.vlm_seconds = call.seconds
-        if result is None or reason is not None:
+            page.reason = call.reason or call.error
+        if result is None or call.text is None:
             page.text = call.fallback
-            page.fallback_reason = reason
+            page.fallback_reason = call.reason or call.error
             page.source = (
                 "layer" if page.decision == "no_signal" else "tesseract"
             )
@@ -540,6 +671,8 @@ class VlmOcrParser(RasterisedDocumentParser):
                         reason=page.fallback_reason or "-",
                         result=call.result,
                         fallback_chars=len(call.fallback),
+                        tiles=call.tiles,
+                        loop_at=call.loop_at,
                     ),
                 )
             else:
@@ -550,6 +683,9 @@ class VlmOcrParser(RasterisedDocumentParser):
                         model=cfg.model,
                         host=host,
                         result=call.result,
+                        tiles=call.tiles,
+                        reason=page.reason,
+                        loop_at=call.loop_at,
                     ),
                 )
         elif call.called:
@@ -563,6 +699,7 @@ class VlmOcrParser(RasterisedDocumentParser):
                     status=call.status,
                     request_id=call.request_id,
                     seconds=call.seconds,
+                    tiles=call.tiles,
                 ),
             )
 
@@ -571,7 +708,7 @@ class VlmOcrParser(RasterisedDocumentParser):
     # ------------------------------------------------------------------
 
     def _apply_text(self, pages: list[_Page]) -> bool:
-        if not any(page.source == "vlm" for page in pages):
+        if not needs_reassembly(page.source for page in pages):
             return False
         self.text = post_process_text(
             "\n\n".join(page.text for page in pages),
@@ -625,6 +762,9 @@ class VlmOcrParser(RasterisedDocumentParser):
                     "error_status": page.error_status,
                     "gate_mode": gate_mode,
                     "plugin_version": __version__,
+                    "tiles": page.tiles,
+                    "loop_at": page.loop_at,
+                    "reason": page.reason,
                 },
             )
 
@@ -648,10 +788,12 @@ class VlmOcrParser(RasterisedDocumentParser):
                     layer_tokens=page.layer_tokens,
                     ref_tokens=page.ref_tokens,
                     source=page.source,
-                    reason=page.fallback_reason,
+                    reason=page.reason,
                     vlm_called=page.vlm_called,
                     vlm_vs_fallback_coverage=page.vlm_vs_fallback_coverage,
                     vlm_vs_fallback_support=page.vlm_vs_fallback_support,
+                    tiles=page.tiles,
+                    loop_at=page.loop_at,
                 ),
             )
 
@@ -705,5 +847,8 @@ class VlmOcrParser(RasterisedDocumentParser):
                 tokens_in=tokens_in,
                 tokens_out=tokens_out,
                 seconds=elapsed,
+                budget_exhausted=any(
+                    page.reason == "budget" for page in pages
+                ),
             ),
         )

@@ -83,6 +83,8 @@ def format_page_line(
     vlm_called: bool = False,
     vlm_vs_fallback_coverage: float | None = None,
     vlm_vs_fallback_support: float | None = None,
+    tiles: int = 1,
+    loop_at: int | None = None,
 ) -> str:
     line = (
         f"vlm_ocr page {page}/{pages} sha={sha_prefix(sha256)} "
@@ -99,6 +101,7 @@ def format_page_line(
             " vlm_vs_fallback_support="
             f"{opt_float(vlm_vs_fallback_support)}"
         )
+    line += f" tiles={tiles} loop_at={opt_int(loop_at)}"
     return line
 
 
@@ -123,6 +126,7 @@ def format_summary_line(
     tokens_in: int,
     tokens_out: int,
     seconds: float,
+    budget_exhausted: bool = False,
 ) -> str:
     return (
         f"vlm_ocr summary file={file} sha={sha_prefix(sha256)} pages={pages} "
@@ -135,5 +139,6 @@ def format_summary_line(
         f"support_mean={opt_float(support_mean)} "
         f"sources={sources or '-'} content={content} "
         f"tokens_in={tokens_in} tokens_out={tokens_out} "
-        f"seconds={seconds:.1f}"
+        f"seconds={seconds:.1f} "
+        f"budget_exhausted={'yes' if budget_exhausted else 'no'}"
     )
