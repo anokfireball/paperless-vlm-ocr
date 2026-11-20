@@ -13,7 +13,7 @@ jobs:
     name: Unit tests and source checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v6
         with:
@@ -44,7 +44,7 @@ jobs:
     name: Verify against the Paperless image
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Read the verified Paperless version
         run: |
@@ -127,7 +127,7 @@ jobs:
       contents: write
       packages: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Read version and look for its tag
         id: version
